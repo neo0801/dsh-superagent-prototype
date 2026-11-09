@@ -48,7 +48,7 @@ export const GithubAccountsSchema = z.object({
 })
 /** A GitLab project path: a namespace and a project, where the namespace may be a group nested in further groups, such as `group/subgroup/project`. */
 const PROJECT_PATH = /^[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+$/
-const OPTIONAL_PROJECT_PATH = /^([A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*)?$/
+const OPTIONAL_PROJECT_PATH = /^([A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+)?$/
 export const GitlabProjectSchema = z.object({
   project: z.string().trim().regex(OPTIONAL_PROJECT_PATH, 'group/project').default(''),
   cli: z.string().trim().default(''),
