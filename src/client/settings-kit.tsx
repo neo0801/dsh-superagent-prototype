@@ -79,29 +79,43 @@ export function ModelField({ id, value, onChange }: { id: string; value: RoleMod
     const { provider, model, effort } = { ...current, ...next }
     onChange(provider.trim() || model.trim() || effort.trim() ? { provider, model, ...effort ? { reasoningEffort: effort } : {} } : null)
   }
-  const models = catalog?.groups.find(group => group.id === current.provider.trim())?.models ?? []
+  const groups = catalog?.groups ?? []
+  const models = groups.find(group => group.id === current.provider.trim())?.models ?? []
+  const efforts = models.find(model => model.id === current.model.trim())?.reasoning?.efforts ?? []
   const fallback = catalog?.default
-  const input = (name: keyof typeof current, label: string, placeholder: string) => <Field label={label}>
-    <Input list={`${id}-${name}s`} spellCheck={false} placeholder={placeholder} value={current[name]}
-      onChange={event => set({ [name]: event.target.value })} />
-  </Field>
-  return <div className="dt-model">
+  // A model saved before this deployment's catalog changed stays selectable, so opening the form cannot silently rewrite it.
+  const keep = (options: readonly string[], selected: string): string[] => selected !== '' && !options.includes(selected) ? [selected] : []
+  const picker = (label: string, selected: string, options: { value: string; label: string }[], onPick: (next: string) => void) =>
+    <Field label={label}>
+      <select className="dt-select" value={selected} onChange={event => onPick(event.target.value)}>
+        {options.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+      </select>
+    </Field>
+  return <div className="dt-model" id={id}>
     <Hint>{fallback ? t('defaultModel', { model: `${fallback.provider} / ${fallback.model}${fallback.reasoningEffort
-      ? ` · ${fallback.reasoningEffort}` : ''}` }) : t('defaultModelUnavailable')}</Hint>
+      ? ` / ${fallback.reasoningEffort}` : ''}` }) : t('defaultModelUnavailable')}</Hint>
     {error && <p className="dt-error">{t('modelCatalogError', { error })}</p>}
     <div className="dt-grid3">
-      {input('provider', t('modelProvider'), t('modelInherit'))}{input('model', t('modelName'), t('modelInherit'))}{input('effort',
-        t('modelEffort'), t('modelEffortDefault'))}
+      {picker(t('modelProvider'), current.provider, [
+        { value: '', label: t('modelInherit') },
+        ...groups.map(group => ({ value: group.id, label: `${group.name} / ${group.id}` })),
+        ...keep(groups.map(group => group.id), current.provider).map(name => ({ value: name, label: name })),
+      ], provider => set({ provider, model: '', effort: '' }))}
+      {picker(t('modelName'), current.model, [
+        { value: '', label: t('modelInherit') },
+        ...models.map(model => ({ value: model.id, label: `${model.name} / ${model.id}` })),
+        ...keep(models.map(model => model.id), current.model).map(name => ({ value: name, label: name })),
+      ], model => set({ model, effort: '' }))}
+      {picker(t('modelEffort'), current.effort, [
+        { value: '', label: t('modelEffortDefault') },
+        ...efforts.map(effort => ({ value: effort.id, label: `${effort.name} / ${effort.id}` })),
+        ...keep(efforts.map(effort => effort.id), current.effort).map(name => ({ value: name, label: name })),
+      ], effort => set({ effort }))}
     </div>
-    <datalist id={`${id}-providers`}>{catalog?.groups.map(group => <option key={group.id}
-      value={group.id}>{group.name}</option>)}</datalist>
-    <datalist id={`${id}-models`}>{models.map(model => <option key={model.id} value={model.id}>{model.name}</option>)}</datalist>
-    <datalist id={`${id}-efforts`}>
-      {(models.find(model => model.id === current.model.trim())?.reasoning?.efforts ?? []).map(effort => <option key={effort.id}
-        value={effort.id}>{effort.name}</option>)}
-    </datalist>
   </div>
 }
+
+
 
 type HistoryChange = NonNullable<HistoryView['items'][number]['changes']>[number]
 function changeText(t: T, change: HistoryChange, sources: SourceView[]): string {
