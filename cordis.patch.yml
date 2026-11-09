@@ -6,6 +6,10 @@
       name: dsh-superagent
     - id: dsh-superagent-github
       name: dsh-superagent/github-watch
+    # Optional GitLab Source; enable it instead of the GitHub Source when the deployment repository is on GitLab.
+    - id: dsh-superagent-gitlab
+      name: dsh-superagent/gitlab-watch
+      disabled: true
     # Optional Feishu Source; requires configuring a bot CLI after enabling.
     - id: dsh-superagent-feishu
       name: dsh-superagent/feishu-watch

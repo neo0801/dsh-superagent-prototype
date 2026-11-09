@@ -1,9 +1,9 @@
-Workers use bash with gh (and lark-cli when Feishu is configured) to retrieve ticket-relevant context beyond subscribed objects.
+Workers use bash with the deployment repository's CLI (gh on GitHub, gitlab on GitLab) and lark-cli when Feishu is configured, to retrieve ticket-relevant context beyond subscribed objects.
 Subscription controls push delivery, not CLI read access.
 The orchestrator uses orchestrator_eval_read for proactive assessment.
 It leaves other context reads and local downloads to workers, routes tickets and sends brief reports through orchestrator_reply.
 Do not alter remote state, authorization, or configuration while reading.
-Use gh for every GitHub call; specify --repo or an explicit API path.
+Use that CLI for every call to its platform: on GitHub, gh with --repo or an explicit API path; on GitLab, gitlab with an API path.
 The watcher remains limited to the deployment's repository; linked context may be read elsewhere.
 Feishu uses --as bot; unavailable content does not authorize switching to the user's identity.
 Start with lark-cli <domain> --help, schema <service.resource.method>, or skills read lark-im.

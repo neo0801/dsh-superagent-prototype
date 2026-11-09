@@ -60,9 +60,19 @@ export class Setup {
   /** Verify account CLIs for a modified source block before saving, ignoring setup errors belonging to other blocks. */
   async checkAccounts(block: SettingsBlock, settings: Settings): Promise<void> {
     const { machine } = this.host
+    const source = block.slice(7)
+    // A Source whose repository or project is now empty is a provider switch in progress: the other Source may not name one
+    // yet, so setup reports the missing deployment repository on restart instead of the save being refused.
+    const field = source === 'github' ? 'repository' : source === 'gitlab' ? 'project' : undefined
+    const emptied = field !== undefined && !settings.sources[source]?.config[field]
     const check = block === 'source:feishu' ? resolveFeishuBot(machine, settings.sources.feishu?.config, this.probe())
-      : resolveDeployment(machine, settings.sources.github?.config, this.probe())
-    await check.catch((error: unknown) => { if (!(error instanceof SetupError) || error.place === block.slice(7)) throw error })
+      : resolveDeployment(machine, { github: settings.sources.github?.config, gitlab: settings.sources.gitlab?.config }, this.probe())
+    await check.catch((error: unknown) => {
+      if (!(error instanceof SetupError)) throw error
+      if (emptied && (error.code === 'repositoryUnset' || error.code === 'projectUnset')) return
+      // A Source's own problems belong to its card; a problem with the deployment as a whole, such as both Sources naming a repository, always refuses the save.
+      if (error.place === source || error.place === 'deployment') throw error
+    })
   }
   async blockCommands(blocked: readonly string[]): Promise<void> {
     if (this.resolved) await writeEnvironment(this.resolved, blocked)
@@ -76,7 +86,7 @@ export class Setup {
   private async resolve(settings: Settings): Promise<Deployment> {
     const { context, machine, lifetime } = this.host
     const probe = this.probe()
-    const deployment = await resolveDeployment(machine, settings.sources.github?.config, probe)
+    const deployment = await resolveDeployment(machine, { github: settings.sources.github?.config, gitlab: settings.sources.gitlab?.config }, probe)
     const feishu = await resolveFeishuBot(machine, settings.sources.feishu?.config, probe).catch((error: unknown) => {
       if (!(error instanceof SetupError)) throw error
       this.feishuProblem = error.problem
