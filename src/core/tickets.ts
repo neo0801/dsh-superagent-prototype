@@ -2,16 +2,17 @@
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
 import { latestAssignment, latestReport, liveTicket, readUntil, runningAssignment, settled, threadKey, waitsForPerson } from './model.ts'
-import type { Assignment, ChannelRef, Evaluation, Follow, Mandate, PolicyEffect, ThreadRef, Ticket, TicketEndBy, TicketInput, TicketOutcome,
-  Trigger, TriggerDisposition } from './model.ts'
+import type { Assignment, BenchGrantedInput, ChannelRef, Evaluation, Follow, Mandate, PolicyEffect, ThreadRef, Ticket, TicketEndBy,
+  TicketInput, TicketOutcome, Trigger, TriggerDisposition } from './model.ts'
 import type { AssessmentOutcome } from './ports.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
 import type { Replies } from './replies.ts'
 import { canRetry } from './stage.ts'
 
 const sameChannel = (a: ChannelRef, b: ChannelRef): boolean => JSON.stringify(a) === JSON.stringify(b)
-/** Whether an Input is a message no person wrote, such as CI's, a bot's, or the main Session's note. */
-export const automatic = (input: TicketInput | undefined): boolean => input?.kind === 'note' || (input?.kind === 'trigger' && !input.human)
+/** Whether an Input is a message no person wrote, such as CI's, a bot's, the main Session's note, or a device grant. */
+export const automatic = (input: TicketInput | undefined): boolean => input?.kind === 'note' || input?.kind === 'bench-granted'
+  || (input?.kind === 'trigger' && !input.human)
 /**
  * Whether a ticket's worker read a Trigger Input before `until`, its latest report or turn end: its Session took the message
  * into a step before then. One delivered before reads were recorded counts as read once it reached the worker by then.
@@ -398,6 +399,32 @@ export class Tickets extends EnginePart {
     const at = this.now()
     this.addInput(ticket, { id: key('input', ticketId, 'note', at, text), kind: 'note', text, at })
     return this.require(ticketId)
+  }
+  /**
+   * Tell an open ticket's worker that its Executor host leased it a bench device; the Input goes out like any automated
+   * Input, and is held back while the ticket waits for a person (see `addInput`).
+   * @throws UserError when the ticket is unknown or has ended.
+   */
+  benchGranted(ticketId: string, input: BenchGrantedInput): void {
+    const ticket = this.require(ticketId)
+    if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+    this.addInput(ticket, input)
+  }
+  /**
+   * Withdraw the bench grants among `inputIds` that have not reached the worker, because their lease was released, revoked or
+   * expired: the Input goes unread and the worker is not woken for a device it may no longer use. One already delivered stays
+   * as the record of what was granted; its wrapper calls are refused by the lease instead.
+   */
+  withdrawBench(ticketId: string, inputIds: readonly string[]): void {
+    const ticket = this.repo.tickets.get(ticketId)
+    if (!ticket) return
+    const withheld = new Set(ticket.inputs.flatMap(input => input.kind === 'bench-granted' && inputIds.includes(input.id)
+      && ticket.undelivered.includes(input.id) ? [input.id] : []))
+    if (!withheld.size) return
+    ticket.undelivered = ticket.undelivered.filter(id => !withheld.has(id))
+    ticket.inputs = ticket.inputs.filter(input => !withheld.has(input.id))
+    ticket.updatedAt = this.now()
+    this.repo.tickets.save(ticket)
   }
   /**
    * Subscribe an open ticket to a Thread its Executor found related, for context: see `Thread.context`.

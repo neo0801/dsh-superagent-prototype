@@ -1,7 +1,7 @@
 /** The domain Engine: the single entry point of the core, and the role interfaces its callers receive. */
 import { UserError } from './errors.ts'
 import { isoTime, liveTicket } from './model.ts'
-import type { ChannelRef, Decision, PolicyEffect, ThreadRef, Ticket, Trigger } from './model.ts'
+import type { BenchGrantedInput, ChannelRef, Decision, PolicyEffect, ThreadRef, Ticket, Trigger } from './model.ts'
 import type { Candidate, Repositories } from './ports.ts'
 import type { EngineOptions } from './part.ts'
 import { Assignments, type WorkerReport } from './assignments.ts'
@@ -220,6 +220,13 @@ export class Engine {
    */
   note(ticketId: string, text: string): Ticket { return this.repo.atomic(() => this.tickets.note(ticketId, text)) }
   /**
+   * The Executor host's grant of a bench device to an open ticket, as an Input its worker reads: see `Tickets.benchGranted`.
+   * @throws UserError when the ticket is unknown or has ended.
+   */
+  benchGranted(ticketId: string, input: BenchGrantedInput): void { this.repo.atomic(() => { this.tickets.benchGranted(ticketId, input) }) }
+  /** Withdraw bench grants that have not reached the worker, once their leases are released, revoked or expired: see `Tickets.withdrawBench`. */
+  withdrawBench(ticketId: string, inputIds: readonly string[]): void { this.repo.atomic(() => { this.tickets.withdrawBench(ticketId, inputIds) }) }
+  /**
    * An Executor's hand-back of a message that reached its ticket but asks for more than it: see `Evals.handback`.
    * @returns whether it was queued for Eval: false while another ticket still decides it, and for one this ticket did not decide (see `Evals.handback`).
    * @throws UserError when the ticket or trigger is unknown, the trigger did not reach the ticket, or the ticket already handed it back.
@@ -267,4 +274,6 @@ export type EngineForPeople = Pick<Engine, 'stopTicket' | 'retryTicket' | 'reeva
 export type EngineForSettings = Pick<Engine, 'policyChanged'>
 /** What the Executor tells the Engine, and what its workers ask of it. */
 export type EngineForExecutor = Pick<Engine, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed'
-  | 'assignmentInterrupted' | 'report' | 'markUnrelated' | 'handback' | 'followForContext' | 'reply'>
+  | 'assignmentInterrupted' | 'report' | 'markUnrelated' | 'handback' | 'followForContext' | 'reply' | 'benchGranted' | 'withdrawBench'>
+/** What the Executor host's bench services tell the Engine about devices they lease and withdraw. */
+export type EngineForBench = Pick<Engine, 'benchGranted' | 'withdrawBench'>

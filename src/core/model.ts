@@ -255,6 +255,15 @@ export type TicketInput =
   | { id: string; kind: 'text'; text: string; at: string }
   /** A fact the main Session gave the ticket from other work: context, which asks for nothing and grants nothing. */
   | { id: string; kind: 'note'; text: string; at: string }
+  /**
+   * An exclusive bench device the ticket's Executor host leased to the Assignment it names: the device and its serial, the
+   * token a call through `wrapper` proves, and when the lease ends. A wrapper call is refused once the lease is released,
+   * revoked or expired, so the Input outlives its use as the record of what was granted.
+   */
+  | { id: string; kind: 'bench-granted'; leaseId: string; requestId: string; deviceId: string; serial: string; token: string
+    expiresAt: string; assignmentId: string; wrapper: string; at: string }
+/** The Input that tells a ticket's worker which bench device it holds, and how to reach it. */
+export type BenchGrantedInput = Extract<TicketInput, { kind: 'bench-granted' }>
 
 /**
  * How a Policy change bears on a ticket: the rules it was accepted under that changed, with their instruction now, or no
