@@ -188,53 +188,72 @@ export async function verifyDirectory(directory: string, subprocess: SubprocessR
 }
 
 /** Where a ticket's `origin` points, split the way git uses it for fetch and push. */
-interface RemoteAddress { scheme: string; host: string; port: number; user: string; path: string }
+interface RemoteAddress { form: 'url' | 'scp'; scheme: string; host: string; port: number; user: string; password: string; path: string }
 const repositoryPath = (path: string): string => decodeURIComponent(path).replace(/^\/+/, '').replace(/\/+$/, '').replace(/\.git$/i, '')
+/** Shows a remote without its credentials: a rejected address must not copy a password into a report. */
+const redact = (url: string): string => {
+  try { const parsed = new URL(url); return `${parsed.protocol}//${parsed.host}${parsed.pathname}` } catch { return url.replace(/^([^@/]+)@/, '***@') }
+}
 function remoteAddress(text: string): RemoteAddress | undefined {
   const url = text.trim()
   try {
     if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(url)) {
       const parsed = new URL(url)
-      return { scheme: parsed.protocol.slice(0, -1).toLowerCase(), host: parsed.hostname.toLowerCase(),
-        port: parsed.port ? Number(parsed.port) : 0, user: parsed.username, path: repositoryPath(parsed.pathname) }
+      return { form: 'url', scheme: parsed.protocol.slice(0, -1).toLowerCase(), host: parsed.hostname.toLowerCase(),
+        port: parsed.port ? Number(parsed.port) : 0, user: parsed.username, password: parsed.password, path: repositoryPath(parsed.pathname) }
     }
-    // A scp-like address, `[user@]host:path`, is SSH.
+    // A scp-like address, `[user[:password]@]host:path`, is SSH.
     const scp = /^(?:(?<user>[^@/]+)@)?(?<host>[^:/]+):(?<path>.+)$/.exec(url)
     if (!scp?.groups) return undefined
-    return { scheme: 'ssh', host: scp.groups.host!.toLowerCase(), port: 0, user: scp.groups.user ?? '', path: repositoryPath(scp.groups.path!) }
+    const user = scp.groups.user ?? ''
+    return { form: 'scp', scheme: 'ssh', host: scp.groups.host!.toLowerCase(), port: 0,
+      user: user.includes(':') ? user.slice(0, user.indexOf(':')) : user, password: user.includes(':') ? 'hidden' : '', path: repositoryPath(scp.groups.path!) }
   } catch { return undefined }
 }
 
 /**
  * Verifies that a ticket's `origin` fetches and pushes the deployment repository over the transport setup checked: HTTPS for
  * GitHub, answered by the credential helper setup verifies, and SSH as `git@host` for GitLab, which has no credential helper.
- * A directory kept from an earlier deployment is refused here, so a provider switch cannot resume an old ticket against the
- * new repository.
+ * The address is read as git resolves it for a push (`git remote get-url --push --all`), so URL rewrites and `pushurl` are
+ * included, and a GitHub `ssh://` address that the worker's rewrite rules leave alone is refused. A directory kept from an
+ * earlier deployment is refused here too. A workspace that is not a checkout has no origin to check.
  */
 export async function verifyTicketRepository(deployment: Pick<Deployment, 'github' | 'gitlab' | 'repository'>, directory: string,
   subprocess: SubprocessRuntime, signal: AbortSignal): Promise<void> {
-  const command = ['git', 'config', '-z', '--get-regexp', '^remote\\.origin\\.(url|pushurl)$']
+  if (!await lstat(join(directory, '.git')).then(() => true, () => false)) return
+  const command = ['git', 'remote', 'get-url', '--push', '--all', 'origin']
   const output = await runAsWorker(subprocess, command, directory, AbortSignal.any([signal, AbortSignal.timeout(60_000)]))
-    .catch((error: unknown) => { if (error instanceof CliError && error.exitCode === 1) return ''; throw error })
-  const urls = output.split('\0').flatMap(entry => { const at = entry.indexOf('\n'); return at < 0 ? [] : [entry.slice(at + 1)] })
+    .catch((error: unknown) => { if (error instanceof CliError && (error.exitCode === 1 || error.exitCode === 2)) return ''; throw error })
+  const urls = output.split('\n').map(line => line.trim()).filter(Boolean)
   if (!urls.length) throw new Error(`The repository in ${directory} names no origin, so a worker cannot push to ${deployment.repository}.`)
   const host = deployment.github ? 'github.com' : new URL(deployment.gitlab!.baseUrl).hostname.toLowerCase()
   const sshOnly = !deployment.github
-  const unrelated = (url: string): Error => new Error(`The repository in ${directory} pushes origin to ${url}, not ${host}/${deployment.repository}; a ticket cannot change repositories, so start a new ticket for this deployment.`)
   for (const url of urls) {
+    const shown = redact(url)
     const address = remoteAddress(url)
-    if (!address || address.host !== host || !sameName(address.path, deployment.repository)) throw unrelated(url)
-    if (address.scheme === 'ssh') {
-      if (address.user !== 'git') throw unrelated(url)
+    if (!address) throw new Error(`The repository in ${directory} names an origin this deployment cannot read: ${shown}.`)
+    const embedded = address.form === 'url'
+      ? address.password !== '' || (address.scheme === 'ssh' ? address.user !== 'git' : address.user !== '')
+      : address.user !== 'git' || address.password !== ''
+    if (embedded) {
+      throw new Error(`The repository in ${directory} names credentials in ${shown}; remove them and let ${sshOnly ? 'the agent\'s SSH configuration' : 'the agent\'s credential helper'} answer.`)
+    }
+    if (address.host !== host || !sameName(address.path, deployment.repository)) {
+      throw new Error(`The repository in ${directory} pushes origin to ${shown}, not ${host}/${deployment.repository}; a ticket cannot change repositories, so start a new ticket for this deployment.`)
+    }
+    if (sshOnly) {
+      if (address.scheme !== 'ssh') {
+        throw new Error(`The repository in ${directory} reaches ${shown} over ${address.scheme}, which this GitLab deployment has no credential helper for; clone the project over SSH.`)
+      }
       // SSH on another port is only reachable through the operator's SSH configuration, which setup does not check.
-      if (sshOnly && address.port !== 0 && address.port !== 22) {
-        throw new Error(`The repository in ${directory} reaches ${url}, whose SSH port setup does not check; use git@${host}, or a matching ~/.ssh/config host.`)
+      if (address.port !== 0 && address.port !== 22) {
+        throw new Error(`The repository in ${directory} reaches ${shown}, whose SSH port setup does not check; use git@${host}, or a matching ~/.ssh/config host.`)
       }
       continue
     }
-    if (sshOnly) throw new Error(`The repository in ${directory} reaches ${url} over ${address.scheme}, which this GitLab deployment has no credential helper for; clone the project over SSH.`)
-    if (address.scheme !== 'https' || address.user !== '') {
-      throw new Error(`The repository in ${directory} names credentials for ${url}; remove them and let the agent's credential helper answer.`)
-    }
+    // GitHub workers authenticate over HTTPS through the helper setup verifies. The scp form is rewritten to HTTPS by
+    // worker-gitconfig; an ssh:// URL is not, so it would still use an SSH identity that setup never checked.
+    if (address.form === 'scp' || address.scheme === 'https') continue
+    throw new Error(`The repository in ${directory} reaches ${shown} over ${address.form === 'url' ? address.scheme : 'SSH'}, which this GitHub deployment does not verify; clone it over HTTPS, or use git@github.com:${deployment.repository}.`)
   }
 }

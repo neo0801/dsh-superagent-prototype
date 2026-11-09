@@ -149,7 +149,7 @@ export async function startRuntime(seed?: (store: Store) => void) {
     [`${BOT} api GET /open-apis/bot/v3/info --as bot --format ndjson`]: '{"bot":{"open_id":"ou_bot"},"code":0,"msg":"ok"}',
     ['git config -z --show-origin --get-all credential.https://github.com.helper']: `file:${workerGitConfig(directory)}\0${credentialHelper(AGENT)}\0`,
     [scoped]: `global\0credential.helper\n\0global\0credential.https://github.com.helper\n${credentialHelper(AGENT)}\0`,
-    ['git config -z --get-regexp ^remote\\.origin\\.(url|pushurl)$']: 'remote.origin.url\ngit@github.com:acme/widgets.git\0',
+    ['git remote get-url --push --all origin']: 'https://github.com/acme/widgets.git\n',
   }
   /** A prepare command (`sh -c`) waits for this while it is set. */
   const hooks: { prepare?: Promise<void> } = {}

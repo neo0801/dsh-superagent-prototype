@@ -187,6 +187,26 @@ describe('ticket directory check', () => {
     await expect(checkRepository('repo', { repository: 'acme/platform/widgets',
       gitlab: { cli: '/opt/gitlab', login: 'agent-bot', email: 'agent@example.com', project: 'acme/platform/widgets', baseUrl: 'https://gitlab.example.com' } }))
       .resolves.toBeUndefined()
+    await git('-C', 'repo', 'remote', 'set-url', 'origin', 'ssh://git@gitlab.example.com:22/acme/platform/widgets.git')
+    await expect(checkRepository('repo', { repository: 'acme/platform/widgets',
+      gitlab: { cli: '/opt/gitlab', login: 'agent-bot', email: 'agent@example.com', project: 'acme/platform/widgets', baseUrl: 'https://gitlab.example.com' } }))
+      .resolves.toBeUndefined()
+  })
+  it('refuses GitHub SSH URIs and origins that embed credentials, without repeating the credentials', async () => {
+    const github = { repository: 'acme/widgets',
+      github: { cli: '/opt/gh', login: 'agent-bot', noreply: '7+agent-bot@users.noreply.github.com' } }
+    const checkRepository = () => verifyTicketRepository(github, join(dir, 'repo'), subprocess(join(dir, 'global')), signal)
+    await git('init', '-q', 'repo')
+    // The worker gitconfig rewrites git@github.com: to HTTPS, but an ssh:// URL is left alone and would use the operator's SSH identity.
+    await git('-C', 'repo', 'remote', 'add', 'origin', 'ssh://git@github.com/acme/widgets.git')
+    await expect(checkRepository()).rejects.toThrow('does not verify')
+    // A password-only URL is still credentials, and a rejection must not copy it into the report.
+    await git('-C', 'repo', 'remote', 'set-url', 'origin', 'https://:REVIEW_DUMMY_SECRET@github.com/acme/widgets.git')
+    const error = await checkRepository().catch((failure: unknown) => failure)
+    expect(String(error)).toContain('names credentials')
+    expect(String(error)).not.toContain('REVIEW_DUMMY_SECRET')
+    await git('-C', 'repo', 'remote', 'set-url', 'origin', 'git@github.com:acme/widgets.git')
+    await expect(checkRepository()).resolves.toBeUndefined()
   })
   it('fails when git cannot read the repository\'s configuration, instead of passing it', async () => {
     await git('init', '-q', 'repo')

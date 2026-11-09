@@ -85,8 +85,9 @@ async function start() {
     [`${BOT} config strict-mode`]: 'strict-mode: bot (source: profile)',
     [`${BOT} api GET /open-apis/bot/v3/info --as bot --format ndjson`]: '{"bot":{"open_id":"ou_bot"},"code":0,"msg":"ok"}',
     ['git config -z --show-origin --get-all credential.https://github.com.helper']: `file:${workerGitConfig(directory)}\0${credentialHelper(AGENT)}\0`,
-    ['git config -z --show-scope --get-regexp ^(credential\\..*|http\\..*extraheader)$']:
+    ['git config -z --show-scope --get-regexp ^(credential\\..*|http\\..*extraheader|core\\.sshcommand|url\\..*\\.(insteadof|pushinsteadof))$']:
       `global\0credential.helper\n\0global\0credential.https://github.com.helper\n${credentialHelper(AGENT)}\0`,
+    ['git remote get-url --push --all origin']: 'https://github.com/acme/widgets.git\n',
   }
   const reader = (text: string) => ({ readFrom: () => ({ text, nextOffset: text.length, lossy: false }) })
   const subprocess = { spawn: (spec: { argv: readonly string[] }) => {
