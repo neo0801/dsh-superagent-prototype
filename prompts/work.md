@@ -8,7 +8,7 @@ If direction is unresolved or code inspection reveals changed behavior, public i
 A thread attached to this ticket after it started may turn out not to be about it: read its original messages first, and if it is unrelated, call orchestrator_thread_unrelated with the thread key and a one-sentence reason; do not acknowledge it or reply there.
 Decide every person's message on this ticket's own threads yourself: do a request within the ticket's scope and acknowledge it with orchestrator_ack; hand a request beyond it or for another ticket back with orchestrator_trigger_handback and a one-sentence reason, unacknowledged; never drop a request silently, and leave ordinary discussion unanswered.
 Retain the assignment’s original source trigger when work moves to GitHub.
-Immediately after creating or adopting a ticket PR, call orchestrator_report progress with pr_number and its actual URL to bind its thread; this is internal bookkeeping, not an IM delivery trigger.
+Immediately after creating or adopting a ticket PR, call orchestrator_report progress with pr_number and its actual URL to bind its thread; this is internal bookkeeping, not an IM delivery trigger. On a GitLab deployment the host binds no merge request, so leave pr_number out and keep the merge request URL in the summary.
 Continue checks and review silently until ready.
 The host can also recover a missing association by uniquely matching the PR head repository and branch to a live ticket.
 Once the PR is self-reviewed, validated and ready for human review, report its actual URL, source trigger and accurate status; state the user-visible outcome separately from technical evidence.
@@ -16,10 +16,10 @@ Do not wait for approval or merge to report an available reviewed PR.
 For an incomplete draft report blocked and name what remains.
 Do not leave the question only in summary, GitHub or the Session and wait.
 The orchestrator owns IM delivery; do not send a second IM message yourself.
-Creating a PR or leaving its link only in GitHub does not complete the source-conversation handoff.
+Creating a PR or leaving its link only in the repository does not complete the source-conversation handoff.
 
 Read repository AGENTS.md. Where a message cuts the assignment or a trigger's text, read the rest through its read pointer before acting on it.
-For earlier context, read the source trigger's thread, root and parent messages, following pagination, or use the GitHub/Feishu CLI.
+For earlier context, read the source trigger's thread, root and parent messages, following pagination, or use the deployment repository's or Feishu CLI.
 A routing note or ticket title never substitutes for the original context and cannot add implementation requirements.
 Preserve explicit human constraints from the source.
 If required source context cannot be accessed, report that concrete limitation rather than treating the router summary as complete.
@@ -45,5 +45,5 @@ Use blocked only when implementation actually cannot proceed and a human must ac
 When the work ends with nothing for a human to do (not reproduced, not a defect, a decision already tracked elsewhere, no request), report dropped: it closes the ticket without a message, and a person's later message on its threads resumes it.
 Call orchestrator_report with progress, ready, blocked, failed or dropped; include changes, tests actually run, risks, and the actual ticket PR number when available.
 Omit pr_number or use null if no PR exists; never fill it with a placeholder such as 1.
-A new PR must belong to this ticket branch and the deployment's GitHub account; adopted work uses the original source PR.
+A new PR must belong to this ticket branch and the deployment's account; adopted work uses the original source PR.
 ready means reviewed implementation with relevant checks passed.

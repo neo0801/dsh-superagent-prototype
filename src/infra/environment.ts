@@ -7,7 +7,7 @@ import { lstat, mkdir, readdir, readFile, rename, unlink, writeFile } from 'node
 import { realpathSync } from 'node:fs'
 import { delimiter, join, resolve } from 'node:path'
 import type { SubprocessOutputReader, SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
-import type { Deployment } from '../deployment.ts'
+import type { Deployment, GitlabAccount } from '../deployment.ts'
 import { SetupError } from '../setup.ts'
 import { CliError } from './commands.ts'
 
@@ -15,7 +15,7 @@ const MARKER = '# Written by dsh-superagent on every start; edits are lost.'
 /** Markers of files written under the project's earlier names (`dsh-tag`, `dsh-go`, `dsh-freelancer`), which `dsh-superagent` owns and replaces too. */
 const LEGACY_MARKERS = ['dsh-tag', 'dsh-go', 'dsh-freelancer'].map(name => `# Written by ${name} on every start; edits are lost.`)
 /** Commands workers need, which `blockedCommands` cannot block: the shims and git. */
-export const WORKER_COMMANDS: readonly string[] = ['gh', 'git', 'lark-cli']
+export const WORKER_COMMANDS: readonly string[] = ['gh', 'git', 'gitlab', 'lark-cli']
 export const workerBin = (stateDir: string): string => join(stateDir, 'worker-bin')
 export const workerGitConfig = (stateDir: string): string => join(stateDir, 'worker-gitconfig')
 const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`
@@ -44,7 +44,7 @@ export const GIT_LOCATION: readonly string[] = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT
  */
 export function agentVariables(stateDir: string): Record<string, string | undefined> {
   return {
-    GH_TOKEN: undefined, GITHUB_TOKEN: undefined,
+    GH_TOKEN: undefined, GITHUB_TOKEN: undefined, GITLAB_TOKEN: undefined, GITLAB_PRIVATE_TOKEN: undefined,
     // A worker's git finds the repository from its directory, never from the host's environment.
     ...Object.fromEntries(GIT_LOCATION.map(name => [name, undefined])),
     GIT_CONFIG_GLOBAL: workerGitConfig(stateDir), GIT_CONFIG_NOSYSTEM: '1',
@@ -54,6 +54,8 @@ export function agentVariables(stateDir: string): Record<string, string | undefi
     GIT_ASKPASS: '', SSH_ASKPASS: undefined, GIT_TERMINAL_PROMPT: '0',
     // Clear operator commit identity variables; prompts specify commit identity and operator env vars would override what a worker sets.
     GIT_AUTHOR_NAME: undefined, GIT_COMMITTER_NAME: undefined, GIT_AUTHOR_EMAIL: undefined, GIT_COMMITTER_EMAIL: undefined,
+    // A GitLab deployment pushes over SSH, so the SSH command must be the one setup verifies the account with, not an operator override.
+    GIT_SSH: undefined, GIT_SSH_COMMAND: undefined,
   }
 }
 
@@ -74,10 +76,11 @@ async function own(file: string, text: string, mode = 0o644): Promise<void> {
 
 /**
  * Atomically writes worker CLI shims and the isolated git configuration file into the state directory, refusing to overwrite foreign files.
- * Each shim strips the shim directory from PATH before exec so wrapper scripts resolving `gh` or `lark-cli` by name reach the real binary.
+ * Each shim strips the shim directory from PATH before exec so wrapper scripts resolving the deployment's CLI or `lark-cli` by name reach the real binary.
  */
-export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' | 'repository' | 'github' | 'feishu'>, blockedCommands: readonly string[]): Promise<void> {
-  const { stateDir, repository, github, feishu } = deployment
+export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' | 'github' | 'gitlab' | 'feishu'>, blockedCommands: readonly string[]): Promise<void> {
+  const { stateDir, github, gitlab, feishu } = deployment
+  const account = github?.login ?? gitlab?.login ?? ''
   const dir = workerBin(stateDir)
   await mkdir(dir, { recursive: true })
   const before = await readdir(dir)
@@ -97,19 +100,24 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
   ].join('\n')
   const run = (program: string): string => `${withoutShims}\nexec ${shellQuote(program)} "$@"`
   const fail = (message: string): string => `echo ${shellQuote(message)} >&2\nexit 1`
-  await shim('gh', run(github.cli))
+  if (github) await shim('gh', run(github.cli))
+  if (gitlab) await shim('gitlab', run(gitlab.cli))
   await shim('lark-cli', feishu ? run(feishu.cli) : fail('lark-cli is unavailable: this installation has no Feishu bot.'))
   for (const name of new Set(blockedCommands.filter(name => !WORKER_COMMANDS.includes(name)))) {
-    await shim(name, fail(`${name} is blocked in this installation; use gh, which acts as ${github.login}.`))
+    await shim(name, fail(`${name} is blocked in this installation; use ${github ? 'gh' : 'gitlab'}, which acts as ${account}.`))
   }
   for (const name of before) if (!kept.has(name)) await unlink(join(dir, name))
+  // Workers push to GitLab over SSH, so only a GitHub deployment learns a credential helper, which its gh wrapper answers.
+  const credentials = github
+    ? ['[credential "https://github.com"]', `\thelper = ${gitQuote(credentialHelper(github.cli))}`,
+      '[url "https://github.com/"]', '\tinsteadOf = git@github.com:', '\tinsteadOf = ssh://git@github.com:']
+    : []
   await own(workerGitConfig(stateDir), [
     MARKER,
     // Make git refuse to commit without an explicit identity set by the worker instead of guessing from the operator's OS user.
     '[user]', '\tuseConfigOnly = true',
     '[credential]', '\thelper =',
-    '[credential "https://github.com"]', `\thelper = ${gitQuote(credentialHelper(github.cli))}`,
-    '[url "https://github.com/"]', '\tinsteadOf = git@github.com:', '\tinsteadOf = ssh://git@github.com/',
+    ...credentials,
     // Include Git LFS filters because the operator's global gitconfig (which usually holds them) is ignored.
     '[filter "lfs"]', '\tclean = git-lfs clean -- %f', '\tsmudge = git-lfs smudge -- %f', '\tprocess = git-lfs filter-process', '\trequired = true',
   ].join('\n') + '\n')
@@ -134,12 +142,32 @@ export async function runAsWorker(subprocess: SubprocessRuntime, argv: string[],
   throw new CliError(read(handle.collected.stderr).trim() || `${argv.join(' ')} ${ended}`, undefined, exitCode ?? undefined)
 }
 
-/** Verifies that worker git invocations resolve the deployment's GitHub credential helper. */
-export async function verifyEnvironment(deployment: Pick<Deployment, 'github' | 'stateDir'>, subprocess: SubprocessRuntime, signal: AbortSignal): Promise<void> {
-  const { github, stateDir } = deployment
+/** Verifies that worker git invocations read the isolated configuration dsh-superagent writes for this deployment, and that a GitLab deployment's SSH login is the account its CLI reported. */
+export async function verifyEnvironment(deployment: Pick<Deployment, 'github' | 'gitlab' | 'stateDir'>, subprocess: SubprocessRuntime, signal: AbortSignal): Promise<void> {
+  const { github, gitlab, stateDir } = deployment
+  // GitHub's helper answers over HTTPS; a GitLab deployment pushes over SSH and has only the fixed identity rule to check.
+  const key = github ? 'credential.https://github.com.helper' : 'user.useConfigOnly'
+  const expected = github ? [credentialHelper(github.cli)] : ['true']
   // `-z` separates fields with NUL and never quotes paths.
-  const helpers = (await runAsWorker(subprocess, ['git', 'config', '-z', '--show-origin', '--get-all', 'credential.https://github.com.helper'], stateDir, AbortSignal.any([signal, AbortSignal.timeout(60_000)])).catch(() => '')).split('\0')
-  if (helpers.join('\0') !== [`file:${workerGitConfig(stateDir)}`, credentialHelper(github.cli), ''].join('\0')) throw new SetupError('gitTooOld')
+  const values = (await runAsWorker(subprocess, ['git', 'config', '-z', '--show-origin', '--get-all', key], stateDir,
+    AbortSignal.any([signal, AbortSignal.timeout(60_000)])).catch(() => '')).split('\0')
+  if (values.join('\0') !== [`file:${workerGitConfig(stateDir)}`, ...expected, ''].join('\0')) throw new SetupError(github ? 'gitTooOld' : 'gitIsolationUnread')
+  if (gitlab) await verifySsh(gitlab, stateDir, subprocess, signal)
+}
+
+/**
+ * Verifies that SSH to the GitLab instance, which is how a worker pushes, signs in as the deployment account: the CLI's API
+ * account says nothing about which key git will use. GitLab Shell answers an authenticated session on stderr with its
+ * greeting and exit code 1, so the greeting is read from the failed command's message.
+ */
+async function verifySsh(account: GitlabAccount, cwd: string, subprocess: SubprocessRuntime, signal: AbortSignal): Promise<void> {
+  let host = ''
+  try { host = new URL(account.baseUrl).hostname } catch { /* Reported as the setup problem below. */ }
+  if (!host) throw new SetupError('gitlabUrl', { url: account.baseUrl })
+  const output = await runAsWorker(subprocess, ['ssh', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', `git@${host}`], cwd,
+    AbortSignal.any([signal, AbortSignal.timeout(90_000)])).catch((error: unknown) => error instanceof CliError ? error.message : `ssh could not run: ${String(error)}`)
+  const actual = /Welcome to GitLab, @([^!\s]+)!/i.exec(output)?.[1] ?? (output.split('\n')[0]!.trim() || 'no GitLab account')
+  if (actual.toLowerCase() !== account.login.toLowerCase()) throw new SetupError('gitlabSshAccount', { host, account: account.login, actual })
 }
 
 /**

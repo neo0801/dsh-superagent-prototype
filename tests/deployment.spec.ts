@@ -13,6 +13,9 @@ let path: string
 const program = (file: string, body = ''): string => { writeFileSync(file, `#!/bin/sh\n${body}\n`); chmodSync(file, 0o755); return file }
 /** Fake gh CLI signed in as `login` with configurable push access to acme/widgets (including its former name acme/gadgets). */
 const gh = (file: string, login: string, push = true): string => program(file, `case "$*" in\n  "api user") echo '{"login":"${login}","id":7}' ;;\n  "api repos/acme/"*" --jq {name: .full_name, push: .permissions.push}") echo '{"name":"acme/widgets","push":${push}}' ;;\n  *) exit 1 ;;\nesac`)
+/** Fake GitLab CLI signed in as `login`, with the given access level (30 is Developer, which may push) on the project at `project`. */
+const gitlab = (file: string, login: string, level = 30, project = 'acme/widgets'): string => program(file,
+  `case "$*" in\n  "api /user") echo '{"username":"${login}","commit_email":"${login}@example.com"}' ;;\n  "api /projects/"*) echo '{"path_with_namespace":"${project}","permissions":{"project_access":{"access_level":${level}}}}' ;;\n  *) exit 1 ;;\nesac`)
 /** Fake lark-cli script body returning canned auth, strict-mode, and bot info responses. */
 const lark = (status: object, mode = 'bot', bot: object = { bot: { open_id: 'ou_bot', app_name: 'Widgets Bot' }, code: 0 }): string =>
   `case "$*" in\n  "auth status") echo '${JSON.stringify(status)}' ;;\n  "config strict-mode") echo 'strict-mode: ${mode} (source: profile)' ;;\n  "api GET /open-apis/bot/v3/info --as bot --format ndjson") echo '${JSON.stringify(bot)}' ;;\nesac`
@@ -30,7 +33,8 @@ beforeEach(async () => {
   program(join(dir, 'bin', 'lark-cli'), lark({ appId: 'cli_bot', brand: 'lark', identities: { bot: { status: 'ready' } } }))
   // Stale worker shims with the same binary name must be skipped regardless of PATH normalization or symlinks.
   program(join(dir, 'state', 'worker-bin', 'gh'))
-  symlinkSync(join(dir, 'state'), join(dir, 'state-link'))
+  // A junction is the directory link Windows creates without administrator rights.
+  symlinkSync(join(dir, 'state'), join(dir, 'state-link'), process.platform === 'win32' ? 'junction' : 'dir')
   await exec('git', ['init', '-q', join(dir, 'widgets')], { env: gitEnv() })
   await exec('git', ['-C', join(dir, 'widgets'), 'remote', 'add', 'origin', 'git@github.com:acme/widgets.git'], { env: gitEnv() })
 })
@@ -58,16 +62,16 @@ describe('configuration schema', () => {
 
 describe('setup', () => {
   it('reads the repository from the GitHub Source and the accounts from their CLIs, skipping the worker shims', async () => {
-    const deployment = await resolveDeployment(machine(), { repository: 'acme/widgets', cli: 'gh' }, probe, path)
+    const deployment = await resolveDeployment(machine(), { github: { repository: 'acme/widgets', cli: 'gh' } }, probe, path)
     expect(deployment).toMatchObject({ repository: 'acme/widgets', github: { cli: join(dir, 'bin', 'gh'), login: 'Agent-Bot', noreply: '7+Agent-Bot@users.noreply.github.com' } })
     expect(deployment.github).toEqual({ cli: join(dir, 'bin', 'gh'), login: 'Agent-Bot', noreply: '7+Agent-Bot@users.noreply.github.com' })
     expect(deployment).not.toHaveProperty('feishu')
     // A renamed repository is still resolved by its old name; notifications carry GitHub's current full_name.
-    expect((await resolveDeployment(machine(), { repository: 'acme/gadgets', cli: 'gh' }, probe, path)).repository).toBe('acme/widgets')
+    expect((await resolveDeployment(machine(), { github: { repository: 'acme/gadgets', cli: 'gh' } }, probe, path)).repository).toBe('acme/widgets')
   })
   it('names what setup needs and where it is set', async () => {
     const needs = (place: string, code: string, values: Record<string, unknown>, github: unknown) =>
-      expect(resolveDeployment(machine(), github, probe, path)).rejects.toEqual(setupError(place, code, values))
+      expect(resolveDeployment(machine(), { github }, probe, path)).rejects.toEqual(setupError(place, code, values))
     const repository = 'acme/widgets'
     await needs('github', 'repositoryUnset', {}, { cli: 'gh' })
     await needs('github', 'agentCliUnset', {}, { repository })
@@ -82,6 +86,24 @@ describe('setup', () => {
     await needs('github', 'repositoryUnreadable', { account: 'Agent-Bot', repository: 'acme/widgets', output }, { repository, cli: unreadable })
     await needs('github', 'agentCliNoAccount', {}, { repository, cli: program(join(dir, 'bin', 'gh-anonymous'), `echo '{}'`) })
     expect(() => executable('nothing-here', join(dir, 'bin'))).toThrow('nothing-here is not an executable file on PATH')
+  })
+  it('reads the project from the GitLab Source, and refuses both Sources naming a repository', async () => {
+    const cli = gitlab(join(dir, 'bin', 'gitlab'), 'Agent-Bot')
+    const deployment = await resolveDeployment(machine(), { gitlab: { project: 'acme/widgets', cli, baseUrl: 'https://gitlab.example.com/' } }, probe, path)
+    expect(deployment).toMatchObject({ repository: 'acme/widgets',
+      gitlab: { cli, login: 'Agent-Bot', project: 'acme/widgets', baseUrl: 'https://gitlab.example.com' } })
+    expect(deployment).not.toHaveProperty('github')
+    // Only one repository provider runs the work.
+    await expect(resolveDeployment(machine(), { github: { repository: 'acme/widgets', cli: 'gh' }, gitlab: { project: 'acme/widgets', cli } }, probe, path))
+      .rejects.toEqual(setupError('deployment', 'repositoryAmbiguous'))
+    // GitLab's Developer role is access level 30; below it the account reads but cannot push.
+    await expect(resolveDeployment(machine(), { gitlab: { project: 'acme/widgets', cli: gitlab(join(dir, 'bin', 'gitlab-reader'), 'Agent-Bot', 20) } }, probe, path))
+      .rejects.toEqual(setupError('gitlab', 'projectReadOnly', { account: 'Agent-Bot', project: 'acme/widgets' }))
+    // Naming no project points at the GitLab card when the GitLab fields show that intent.
+    await expect(resolveDeployment(machine(), { gitlab: { cli: 'gitlab' } }, probe, path)).rejects.toEqual(setupError('gitlab', 'projectUnset'))
+    await expect(resolveDeployment(machine(), { gitlab: {} }, probe, path)).rejects.toEqual(setupError('github', 'repositoryUnset'))
+    await expect(resolveDeployment(machine(), { gitlab: { project: 'acme/widgets', cli: join(dir, 'missing') } }, probe, path))
+      .rejects.toEqual(setupError('gitlab', 'gitlabCliMissing', { output: `${join(dir, 'missing')} is not an executable file` }))
   })
   it('reads the Feishu bot from a bot-only lark-cli, or finds none when the Feishu Source names no CLI', async () => {
     expect(await resolveFeishuBot(machine(), {}, probe, path)).toBeUndefined()
