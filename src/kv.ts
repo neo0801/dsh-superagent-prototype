@@ -5,6 +5,7 @@
 import type { PromptVersion } from './app/prompts.ts'
 import type { SettingsVersion } from './app/store.ts'
 import type { RepositoryIdentity } from './core/index.ts'
+import type { BenchRuntime } from './executor/bench-authorize.ts'
 import type { SettingsSave } from './policy.ts'
 import type { Retry } from './sources/github.ts'
 
@@ -32,6 +33,8 @@ export const KV = {
     builtIn: family<string, [base: string]>('prompt-built-in:') },
   /** Runtime: the main Session's ID, and the repository identity the previous start worked on. */
   runtime: { masterId: record<string>('master-id'), deployment: record<RepositoryIdentity>('deployment') },
+  /** Bench devices: the ledger, the FIFO of requests and the leases, written only by the Executor host's `BenchService`. */
+  bench: { runtime: record<BenchRuntime>('bench:runtime') },
   /** Sessions: prompt revisions each Session has worked under, ordered oldest first; the last entry (`.at(-1)`) is its active revision. */
   sessions: { prompts: family<number[], [session: string]>('session-prompts:') },
   /** Schema 11 migration: legacy main-Session queues imported into the effect table. */

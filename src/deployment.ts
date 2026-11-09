@@ -22,6 +22,8 @@ export const Config = s.object({
     .description('Pages of thread context one assessment may read.').volatile(),
   admissionContextTimeoutMs: s.number().min(LIMITS.admissionContextTimeoutMs.min).max(LIMITS.admissionContextTimeoutMs.max).step(1)
     .default(15000).description('Time limit of one context read during an assessment, in milliseconds.').volatile(),
+  bench: s.any().description('Bench devices this installation leases to workers, the adb binary and server to reach them, and the lease length; '
+    + 'with no device it is off, and a change needs a restart. docs/006-deployment.md describes the fields.'),
 })
 export type DeploymentConfig = ReturnType<typeof Config>
 export interface Machine {
@@ -29,6 +31,8 @@ export interface Machine {
   promptMaxChars: Volatile<number>
   admissionContextMaxPages: Volatile<number>
   admissionContextTimeoutMs: Volatile<number>
+  /** The bench devices this installation leases, and the adb that reaches them; absent when none is configured. */
+  bench?: BenchConfig
 }
 const MOVED: Record<string, string> = {
   repository: 'on the GitHub Source', branchPrefix: 'in the prepare command of the Execution settings', github: 'on the GitHub Source',
@@ -36,12 +40,110 @@ const MOVED: Record<string, string> = {
   worktreeRoot: 'the ticket directory of the Execution settings', blockedCommands: 'in the Execution settings',
 }
 
+/** How long one lease may last, in seconds, when the configuration does not say. */
+export const LEASE_SECONDS = 1800
+/** The adb top-level commands a device may grant; `am`, `pm` and `getprop` run through `shell`, and server commands are never granted. */
+export const BENCH_ACTIONS: readonly string[] = ['shell', 'install', 'uninstall', 'push', 'pull', 'logcat', 'exec-out', 'get-state',
+  'get-serialno', 'bugreport', 'forward', 'reverse', 'reboot', 'root', 'unroot', 'remount', 'emu']
+/** One bench device the Executor host may lease to a ticket's worker. */
+export interface BenchDevice {
+  id: string
+  serial: string
+  /** Deployment repositories it serves, `group/project` or `owner/name`; empty serves any. */
+  projects: string[]
+  /** What the device offers, as the worker asks for them. */
+  capabilities: string[]
+  /** The adb top-level commands it grants (see `BENCH_ACTIONS`). */
+  actions: string[]
+  maintainer?: string
+}
+/** The bench devices, the adb that reaches them, its fixed server socket, and how long a lease lasts. */
+export interface BenchConfig {
+  /** The adb executable: a command name, or an absolute path resolved at startup. */
+  adb: string
+  /** The adb server every probe and wrapper call uses; a fixed local default when absent. */
+  adbServerSocket?: string
+  leaseSeconds: number
+  devices: BenchDevice[]
+}
+const BENCH_KEYS = ['adb', 'adbServerSocket', 'leaseSeconds', 'devices'] as const
+const DEVICE_KEYS = ['id', 'serial', 'projects', 'capabilities', 'actions', 'maintainer'] as const
+const benchText = (value: unknown, what: string): string => {
+  if (typeof value !== 'string' || !value.trim()) throw new Error(`bench ${what} must be a non-empty string`)
+  return value.trim()
+}
+const benchList = (value: unknown, what: string): string[] => {
+  if (value === undefined) return []
+  if (!Array.isArray(value)) throw new Error(`bench ${what} must be a list`)
+  return value.map(item => benchText(item, what))
+}
+/**
+ * The adb server socket in adb's own form: `tcp:<host>:<port>`, or `localfilesystem:<path>`, with a bare `<host>:<port>`
+ * taken as tcp. Every probe and wrapper call passes it through `ADB_SERVER_SOCKET`, and clears the other server variables,
+ * so a Worker's own adb server options never reach a leased device.
+ */
+export function benchAdbServerSocket(value: string): string {
+  const socket = value.trim()
+  if (/^localfilesystem:.+/.test(socket) || /^tcp:.+:\d+$/.test(socket)) return socket
+  const bare = /^([^\s:]+):(\d+)$/.exec(socket)
+  if (bare) return `tcp:${bare[1]}:${bare[2]}`
+  throw new Error(`bench adbServerSocket must be tcp:<host>:<port> or localfilesystem:<path>, not ${socket}`)
+}
+/**
+ * Parse and validate the `bench` block, or return undefined when it names no device: the feature is off, and the
+ * installation behaves as it did before. Ids and serials are unique, actions are adb top-level commands a device may grant,
+ * and a lease lasts between 60 seconds and a day.
+ */
+export function benchConfigOf(value: unknown): BenchConfig | undefined {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'object' || Array.isArray(value)) throw new Error('bench must be a mapping')
+  const block = value as Record<string, unknown>
+  const unknown = Object.keys(block).filter(key => !BENCH_KEYS.includes(key as never))
+  if (unknown.length) throw new Error(`bench has keys it does not use: ${unknown.join(', ')}`)
+  const raw = block.devices
+  if (raw === undefined) return undefined
+  if (!Array.isArray(raw)) throw new Error('bench devices must be a list')
+  if (!raw.length) return undefined
+  const ids = new Set<string>(), serials = new Set<string>()
+  const devices = raw.map((item, index): BenchDevice => {
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) throw new Error(`bench devices[${index}] must be a mapping`)
+    const device = item as Record<string, unknown>
+    const extra = Object.keys(device).filter(key => !DEVICE_KEYS.includes(key as never))
+    if (extra.length) throw new Error(`bench devices[${index}] has keys it does not use: ${extra.join(', ')}`)
+    const id = benchText(device.id, `devices[${index}].id`), serial = benchText(device.serial, `devices[${index}].serial`)
+    if (ids.has(id)) throw new Error(`bench device id ${id} is used twice`)
+    if (serials.has(serial)) throw new Error(`bench device serial ${serial} is used twice`)
+    ids.add(id); serials.add(serial)
+    const projects = benchList(device.projects, `devices[${index}].projects`)
+    for (const project of projects) if (!PROJECT_PATH.test(project)) throw new Error(`bench device ${id} names a project that is not group/project: ${project}`)
+    const actions = benchList(device.actions, `devices[${index}].actions`)
+    if (!actions.length) throw new Error(`bench device ${id} grants no action`)
+    for (const action of actions) {
+      if (BENCH_ACTIONS.includes(action)) continue
+      throw new Error(`bench device ${id} grants ${action}, which is not an adb device action; actions are adb top-level commands such as `
+        + `${BENCH_ACTIONS.slice(0, 5).join(', ')} (run am, pm and getprop through shell), never server or global commands`)
+    }
+    const maintainer = device.maintainer === undefined ? undefined : benchText(device.maintainer, `devices[${index}].maintainer`)
+    return { id, serial, projects, capabilities: benchList(device.capabilities, `devices[${index}].capabilities`), actions,
+      ...maintainer === undefined ? {} : { maintainer } }
+  })
+  const adb = block.adb === undefined ? 'adb' : benchText(block.adb, 'adb')
+  if (adb.includes('/') && !isAbsolute(adb)) throw new Error('bench adb must be a command name or an absolute path')
+  const socket = block.adbServerSocket === undefined ? undefined : benchAdbServerSocket(benchText(block.adbServerSocket, 'adbServerSocket'))
+  const seconds = block.leaseSeconds === undefined ? LEASE_SECONDS : block.leaseSeconds
+  if (typeof seconds !== 'number' || !Number.isInteger(seconds) || seconds < 60 || seconds > 86_400) {
+    throw new Error('bench leaseSeconds must be a whole number of seconds from 60 to 86400')
+  }
+  return { adb, ...socket === undefined ? {} : { adbServerSocket: socket }, leaseSeconds: seconds, devices }
+}
+
 /** Read machine settings and reject unknown configuration keys (naming where deprecated keys moved). */
 export function machineOf(config: DeploymentConfig): Machine {
   const unknown = Object.keys(config).filter(key => !(key in (Config.dict ?? {})))
   if (unknown.length) throw new Error(`dsh-superagent configuration has keys it does not use: ${unknown.map(key => MOVED[key] ? `${key} (now ${MOVED[key]})` : key).join(', ')}; docs/006-deployment.md lists the keys`)
   const { stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs } = config
-  return { stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs }
+  const bench = benchConfigOf((config as { bench?: unknown }).bench)
+  return { stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs, ...bench ? { bench } : {} }
 }
 
 export const GithubAccountsSchema = z.object({
