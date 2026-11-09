@@ -448,6 +448,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 
 `tests/fixtures/` holds what several tests share: `host.ts`, a simulated DeepSeek Harness host; `panel-server.ts` and `panel.tsx`, the fake management API and the panel around a page; `deployment.ts`, a resolved deployment; `git.ts`, the environment of every git the tests start, which names no repository; and `async.ts`.
 
+The suite targets a POSIX host. Some tests build their own `PATH` with `:` separators, start `#!/bin/sh` stand-ins as subprocesses, or compare `path.relative` results with the forward-slash paths of the tables here; on Windows those cases fail for platform reasons (path separator, no direct execution of shell-script stand-ins, no symlink privilege for a directory link), and CI runs them on POSIX. Where a test needs a directory link, it uses a Windows junction instead.
+
 ## Persistence
 
 One SQLite file, `<stateDir>/orchestrator.sqlite`, which only the Store opens.

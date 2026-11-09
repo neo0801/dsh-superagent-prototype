@@ -2,7 +2,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { MessageId } from '@deepseek-ai/dsh-llm'
-import { scopeParentOf } from '@deepseek-ai/dsh-scope'
+import { scopeOf, scopeParentOf } from '@deepseek-ai/dsh-scope'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { dirname } from 'node:path'
 import { z } from 'zod'
@@ -60,6 +60,18 @@ declare module '@deepseek-ai/cordis' {
  */
 const WORK_TOOLS = ['read', 'write', 'edit', 'read_image', 'glob', 'grep', 'bash', 'pwsh', 'job_output', 'job_list', 'job_kill', 'web_search',
   'web_fetch', 'skill', 'todo_write', 'subagent', 'list_subagent_models', 'send_message', 'list_agents', 'interrupt_agent']
+/** The shell tool the running profile exposes: DSH registers bash on POSIX and pwsh on Windows. */
+const SHELL_TOOL: 'bash' | 'pwsh' = process.platform === 'win32' ? 'pwsh' : 'bash'
+/**
+ * The scope key DSH holds for one Agent. `agent.ctx` does not always carry it: DSH resolves a service such as `tools`
+ * through a scoped instance, so the service's own context is the reliable carrier of the Agent's scope key.
+ */
+function agentScope(ctx: Context): object | undefined {
+  const direct = scopeOf(ctx)
+  if (direct !== undefined) return direct
+  const service = (ctx.tools as unknown as { ctx?: Context }).ctx
+  return service === undefined ? undefined : scopeOf(service)
+}
 /** What the main Session is told when it would wait: what it waits for comes to it, and a waiting step holds back the next. */
 const NO_WAIT = 'Reports, follow_up notices, new candidates and a background job\'s end with its output arrive by themselves as messages; '
   + 'end the turn instead of waiting for them.'
@@ -76,7 +88,7 @@ const SLEEP = /(?:^|[;&|({!`\n]|\b(?:do|then|else|elif|if|while|until|time|exec|
  */
 function noWait({ name, arguments: input }: { name: string; arguments: unknown }, routed: () => boolean): string | undefined {
   const args = (input ?? {}) as { command?: unknown; timeoutMs?: unknown; run_in_background?: unknown; wait?: unknown; timeout_ms?: unknown }
-  if (name === 'bash') {
+  if (name === 'bash' || name === 'pwsh') {
     const sleeps = typeof args.command === 'string' && SLEEP.test(args.command)
     if (sleeps || typeof args.timeoutMs === 'number' && args.timeoutMs > 30_000) return NO_WAIT
     if (args.timeoutMs === undefined && args.run_in_background !== true && !routed()) return DEFAULT_WAIT
@@ -260,7 +272,7 @@ export class Sessions {
     const register = this.registerTool(agent, binding)
     for (const tool of host.tools(agent, ticket)) register(tool.name, tool.description, tool.schema, tool.execute)
     if (master) {
-      binding.disposers.push(agent.ctx.tools.restrict({ allow: ['skill', 'bash', 'read', 'read_image', 'job_output', 'job_list', 'job_kill'] }),
+      binding.disposers.push(agent.ctx.tools.restrict({ allow: ['skill', SHELL_TOOL, 'read', 'read_image', 'job_output', 'job_list', 'job_kill'] }),
         agent.ctx.tools.guard(execution => noWait(execution, () => this.routed(agent))))
     } else {
       // An Executor Session keeps the profile's work tools it has, which DSH requires to be known; its own tools are not masked.
@@ -283,17 +295,23 @@ export class Sessions {
   /**
    * An Executor Session's tools: only the profile's work tools, which DSH requires to be known, and none once its ticket
    * ended. A failed or blocked worker keeps its tools, so a person may continue it in its Session; only automated input waits
-   * (see the executor). Read inherited tools through the parent scope, which includes the preset's tools. The global view
-   * misses preset tools; the agent's own view also includes local tools such as subagent, which restrict refuses to name.
+   * (see the executor). The allow list comes from the preset's parent scope, because the global view misses preset tools and
+   * the agent's own view adds local tools such as subagent, which `restrict` refuses to name. When DSH does not expose a
+   * scope key through the context, the list stays empty and no restriction is applied at all.
    */
   private workOnly(agent: Agent, ticketId: string): (() => void)[] {
     const store = this.host.store
-    const parent = scopeParentOf(agent)
-    const allow = WORK_TOOLS.filter(name => agent.ctx.tools.get(name, parent))
-    return [agent.ctx.tools.restrict({ allow }), agent.ctx.tools.guard(() => {
+    const scope = agentScope(agent.ctx)
+    const parent = scope === undefined ? undefined : scopeParentOf(scope)
+    const allow = WORK_TOOLS.filter(name => parent !== undefined && agent.ctx.tools.get(name, parent) !== undefined)
+    const guard = agent.ctx.tools.guard(() => {
       const current = store.tickets.get(ticketId)
       return !current || !liveTicket(current) ? 'Ticket ended; new work needs a new authorized ticket' : undefined
-    })]
+    })
+    // A scope this DSH does not expose through the context leaves the allow list empty, and an empty allow list masks every
+    // inherited tool, including the preset's own shell, files and search. A worker that cannot work is worse than one whose
+    // preset, which already holds only work tools, is not narrowed further.
+    return allow.length === 0 ? [guard] : [agent.ctx.tools.restrict({ allow }), guard]
   }
   /**
    * A subagent of an Executor Session, or of one of its subagents, which runs under DSH's `standard` preset with the worker's
