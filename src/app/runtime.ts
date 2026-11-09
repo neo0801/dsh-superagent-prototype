@@ -80,6 +80,8 @@ export class Runtime extends Service implements SourceHost {
   private releaseLock?: () => Promise<void>
   private closingFlag = false
   private stopping?: Promise<void>
+  /** Whether this start resolved a different deployment repository than the previous start recorded. */
+  private deploymentChangedFlag = false
   private readonly sourceDeps: SourceContextDeps
   private readonly toolHost: MainToolsHost & ExecutorToolsHost
   /** Non-zero while a main-Session tool is executing an Engine command, suppressing self-triggered domain event notices. */
@@ -128,6 +130,7 @@ export class Runtime extends Service implements SourceHost {
         sourceHost: this, setup, requestPass: () => { this.passes.request() } })
       this.executor = new DshExecutor({ context: ctx, get engine() { return runtime.engine }, store, effects, health: board.claim('worker'), machine,
         lifetime: this.lifetime, sessions, closing: () => this.closing(), paused: () => this.paused(), environment, sourceLink: link,
+        deployment: () => setup.deployment, deploymentChanged: () => this.deploymentChangedFlag,
         repliedTo: trigger => repliedTo({ store, sources }, trigger) })
       this.assessor = new MasterAssessor({ get engine() { return runtime.engine }, commands, get deployment() { return setup.deployment }, effects,
         settings: () => store.settings(), paused: () => this.paused(), threadContext: trigger => sources.threadContext(trigger),
@@ -206,6 +209,12 @@ export class Runtime extends Service implements SourceHost {
       this.runtimeHealth.set({ ...health('paused', 'setupPending'), at: now() })
       return
     }
+    // Remember which repository this installation works on, so a later start after a provider switch refuses tickets that
+    // were accepted for the old one instead of resuming them against the new one.
+    const resolved = this.setup.deployment
+    const previousDeployment = this.store.get(KV.runtime.deployment)
+    this.deploymentChangedFlag = previousDeployment !== undefined && previousDeployment.repository !== resolved.repository
+    if (previousDeployment?.repository !== resolved.repository) this.store.set(KV.runtime.deployment, { repository: resolved.repository })
     this.sessions.install()
     this.executor.install()
     await this.sessions.ensure(this.masterId, this.machine.stateDir, 'dsh-superagent orchestrator', 'orchestrator')
