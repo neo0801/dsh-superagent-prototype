@@ -244,6 +244,8 @@ The process environment that setup writes:
 
 A file in `worker-bin` or `worker-gitconfig` that dsh-superagent did not write stops setup. A Ticket directory inside a git repository whose own configuration adds credentials fails the Ticket.
 
+Every launch of a Ticket's directory is checked the way the worker's git would read it: its local configuration may set no credential helper, HTTP extraheader, `core.sshCommand` or URL rewrite, and its `origin` must fetch and push the deployment repository — over HTTPS for GitHub, whose credential helper setup verifies, or over SSH as `git@<instance host>` for GitLab. A directory kept from another repository, such as after a provider switch, fails the Ticket instead of working on the new repository.
+
 ## Try it
 
 From an allowed GitHub account, open an Issue or post a comment containing `@<agent login> <request>`. Within a polling interval (one minute by default), Overview should show a Ticket. The agent acknowledges the request, works in its own Session and directory, and delivers in the original conversation. For Feishu, mention the bot in a configured chat.

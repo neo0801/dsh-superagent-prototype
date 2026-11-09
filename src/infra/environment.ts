@@ -10,6 +10,7 @@ import type { SubprocessOutputReader, SubprocessRuntime } from '@deepseek-ai/dsh
 import type { Deployment, GitlabAccount } from '../deployment.ts'
 import { SetupError } from '../setup.ts'
 import { CliError } from './commands.ts'
+import { sameName } from './text.ts'
 
 const MARKER = '# Written by dsh-superagent on every start; edits are lost.'
 /** Markers of files written under the project's earlier names (`dsh-tag`, `dsh-go`, `dsh-freelancer`), which `dsh-superagent` owns and replaces too. */
@@ -172,14 +173,68 @@ async function verifySsh(account: GitlabAccount, cwd: string, subprocess: Subpro
 
 /**
  * Verifies that a ticket directory's local or worktree git config defines no custom `credential.*` or `http.*extraheader`
- * keys, which the agent's git would read from the repository's own config and act on.
+ * keys, no `core.sshCommand`, and no `url.*.insteadOf` rewrite, which the agent's git would read from the repository's own
+ * config and act on in place of the account and SSH command setup verified.
  */
 export async function verifyDirectory(directory: string, subprocess: SubprocessRuntime, signal: AbortSignal): Promise<void> {
-  const keys = ['git', 'config', '-z', '--show-scope', '--get-regexp', '^(credential\\..*|http\\..*extraheader)$']
+  const keys = ['git', 'config', '-z', '--show-scope', '--get-regexp',
+    '^(credential\\..*|http\\..*extraheader|core\\.sshcommand|url\\..*\\.(insteadof|pushinsteadof))$']
   // `git config --get-regexp` exits with code 1 when no keys match.
   const output = await runAsWorker(subprocess, keys, directory, AbortSignal.any([signal, AbortSignal.timeout(60_000)]))
     .catch((error: unknown) => { if (error instanceof CliError && error.exitCode === 1) return ''; throw error })
   const scoped = output.split('\0')
   const local = scoped.flatMap((scope, index) => index % 2 === 0 && (scope === 'local' || scope === 'worktree') ? [scoped[index + 1]!.split('\n')[0]!] : [])
   if (local.length) throw new Error(`The git configuration of the repository in ${directory} sets ${local.join(', ')}, which the agent's git would also read; remove them.`)
+}
+
+/** Where a ticket's `origin` points, split the way git uses it for fetch and push. */
+interface RemoteAddress { scheme: string; host: string; port: number; user: string; path: string }
+const repositoryPath = (path: string): string => decodeURIComponent(path).replace(/^\/+/, '').replace(/\/+$/, '').replace(/\.git$/i, '')
+function remoteAddress(text: string): RemoteAddress | undefined {
+  const url = text.trim()
+  try {
+    if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(url)) {
+      const parsed = new URL(url)
+      return { scheme: parsed.protocol.slice(0, -1).toLowerCase(), host: parsed.hostname.toLowerCase(),
+        port: parsed.port ? Number(parsed.port) : 0, user: parsed.username, path: repositoryPath(parsed.pathname) }
+    }
+    // A scp-like address, `[user@]host:path`, is SSH.
+    const scp = /^(?:(?<user>[^@/]+)@)?(?<host>[^:/]+):(?<path>.+)$/.exec(url)
+    if (!scp?.groups) return undefined
+    return { scheme: 'ssh', host: scp.groups.host!.toLowerCase(), port: 0, user: scp.groups.user ?? '', path: repositoryPath(scp.groups.path!) }
+  } catch { return undefined }
+}
+
+/**
+ * Verifies that a ticket's `origin` fetches and pushes the deployment repository over the transport setup checked: HTTPS for
+ * GitHub, answered by the credential helper setup verifies, and SSH as `git@host` for GitLab, which has no credential helper.
+ * A directory kept from an earlier deployment is refused here, so a provider switch cannot resume an old ticket against the
+ * new repository.
+ */
+export async function verifyTicketRepository(deployment: Pick<Deployment, 'github' | 'gitlab' | 'repository'>, directory: string,
+  subprocess: SubprocessRuntime, signal: AbortSignal): Promise<void> {
+  const command = ['git', 'config', '-z', '--get-regexp', '^remote\\.origin\\.(url|pushurl)$']
+  const output = await runAsWorker(subprocess, command, directory, AbortSignal.any([signal, AbortSignal.timeout(60_000)]))
+    .catch((error: unknown) => { if (error instanceof CliError && error.exitCode === 1) return ''; throw error })
+  const urls = output.split('\0').flatMap(entry => { const at = entry.indexOf('\n'); return at < 0 ? [] : [entry.slice(at + 1)] })
+  if (!urls.length) throw new Error(`The repository in ${directory} names no origin, so a worker cannot push to ${deployment.repository}.`)
+  const host = deployment.github ? 'github.com' : new URL(deployment.gitlab!.baseUrl).hostname.toLowerCase()
+  const sshOnly = !deployment.github
+  const unrelated = (url: string): Error => new Error(`The repository in ${directory} pushes origin to ${url}, not ${host}/${deployment.repository}; a ticket cannot change repositories, so start a new ticket for this deployment.`)
+  for (const url of urls) {
+    const address = remoteAddress(url)
+    if (!address || address.host !== host || !sameName(address.path, deployment.repository)) throw unrelated(url)
+    if (address.scheme === 'ssh') {
+      if (address.user !== 'git') throw unrelated(url)
+      // SSH on another port is only reachable through the operator's SSH configuration, which setup does not check.
+      if (sshOnly && address.port !== 0 && address.port !== 22) {
+        throw new Error(`The repository in ${directory} reaches ${url}, whose SSH port setup does not check; use git@${host}, or a matching ~/.ssh/config host.`)
+      }
+      continue
+    }
+    if (sshOnly) throw new Error(`The repository in ${directory} reaches ${url} over ${address.scheme}, which this GitLab deployment has no credential helper for; clone the project over SSH.`)
+    if (address.scheme !== 'https' || address.user !== '') {
+      throw new Error(`The repository in ${directory} names credentials for ${url}; remove them and let the agent's credential helper answer.`)
+    }
+  }
 }
