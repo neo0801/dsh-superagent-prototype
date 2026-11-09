@@ -245,17 +245,22 @@ describe('the repository the host\'s environment names', () => {
   })
 })
 
-/** Subprocess runtime that returns canned output: the isolated git configuration and the SSH session's greeting. */
-const canned = (git: string, ssh: string): SubprocessRuntime => ({
-  spawn: ({ argv }: { argv: readonly string[] }) => {
-    const output = argv[0] === 'git' ? git : ''
-    // `ssh -T` reports the GitLab greeting on stderr and exits with 1, so runAsWorker reads the greeting from the failure.
-    const failure = argv[0] === 'ssh' ? ssh : ''
-    const reader = (text: string) => ({ readFrom: () => ({ text, nextOffset: text.length, lossy: false }) })
-    return { done: Promise.resolve({ exitCode: argv[0] === 'ssh' ? 1 : 0 }),
-      collected: { stdout: reader(output), stderr: reader(failure) } }
-  },
-}) as unknown as SubprocessRuntime
+/** Subprocess runtime that records every command and returns canned output: the isolated git configuration and the SSH greeting. */
+const canned = (git: string, ssh: string): { runtime: SubprocessRuntime; calls: string[][] } => {
+  const calls: string[][] = []
+  const runtime = {
+    spawn: ({ argv }: { argv: readonly string[] }) => {
+      calls.push([...argv])
+      const output = argv[0] === 'git' ? git : ''
+      // `ssh -T` reports the GitLab greeting on stderr and exits with 1, so runAsWorker reads the greeting from the failure.
+      const failure = argv[0] === 'ssh' ? ssh : ''
+      const reader = (text: string) => ({ readFrom: () => ({ text, nextOffset: text.length, lossy: false }) })
+      return { done: Promise.resolve({ exitCode: argv[0] === 'ssh' ? 1 : 0 }),
+        collected: { stdout: reader(output), stderr: reader(failure) } }
+    },
+  } as unknown as SubprocessRuntime
+  return { runtime, calls }
+}
 
 describe('GitLab worker environment', () => {
   const signal = new AbortController().signal
@@ -263,15 +268,24 @@ describe('GitLab worker environment', () => {
     project: 'acme/widgets', baseUrl: 'https://gitlab.example.com', ...overrides })
   const deployment = (overrides: Partial<GitlabAccount> = {}) => ({ stateDir: dir, gitlab: account(overrides) })
   const config = () => `file:${workerGitConfig(dir)}\0true\0`
+  const SSH = ['ssh', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', 'git@gitlab.example.com']
   it('accepts an SSH session that signs in as the deployment account', async () => {
-    await expect(verifyEnvironment(deployment(), canned(config(), 'Welcome to GitLab, @agent-bot!\n'), signal)).resolves.toBeUndefined()
+    const { runtime, calls } = canned(config(), 'Welcome to GitLab, @agent-bot!\n')
+    await expect(verifyEnvironment(deployment(), runtime, signal)).resolves.toBeUndefined()
+    // The check targets the instance host as the deployment account, non-interactively, before it reads the greeting.
+    expect(calls).toContainEqual(['git', 'config', '-z', '--show-origin', '--get-all', 'user.useConfigOnly'])
+    expect(calls).toContainEqual(SSH)
   })
   it('refuses an SSH session that signs in as another account', async () => {
-    await expect(verifyEnvironment(deployment(), canned(config(), 'Welcome to GitLab, @someone-else!\n'), signal))
+    const { runtime, calls } = canned(config(), 'Welcome to GitLab, @someone-else!\n')
+    await expect(verifyEnvironment(deployment(), runtime, signal))
       .rejects.toMatchObject({ code: 'gitlabSshAccount', values: { host: 'gitlab.example.com', account: 'agent-bot', actual: 'someone-else' } })
+    expect(calls).toContainEqual(SSH)
   })
-  it('refuses a GitLab URL without a host', async () => {
-    await expect(verifyEnvironment(deployment({ baseUrl: 'gitlab.example.com' }), canned(config(), ''), signal))
+  it('refuses a GitLab URL without a host, without opening an SSH session', async () => {
+    const { runtime, calls } = canned(config(), '')
+    await expect(verifyEnvironment(deployment({ baseUrl: 'gitlab.example.com' }), runtime, signal))
       .rejects.toMatchObject({ code: 'gitlabUrl', values: { url: 'gitlab.example.com' } })
+    expect(calls.some(call => call[0] === 'ssh')).toBe(false)
   })
 })
