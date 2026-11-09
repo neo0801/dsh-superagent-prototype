@@ -5,9 +5,10 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SENSITIVE_ENV_PATTERN, type SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
-import { GIT_LOCATION, agentVariables, credentialHelper, runAsWorker, verifyDirectory, withoutDirectory, workerBin, workerGitConfig, writeEnvironment }
+import { GIT_LOCATION, agentVariables, credentialHelper, runAsWorker, verifyDirectory, verifyEnvironment, withoutDirectory, workerBin, workerGitConfig, writeEnvironment }
   from '../src/infra/environment.ts'
 import { CliError } from '../src/infra/commands.ts'
+import type { GitlabAccount } from '../src/deployment.ts'
 import { testDeployment } from './fixtures/deployment.ts'
 import { gitEnv } from './fixtures/git.ts'
 
@@ -182,5 +183,36 @@ describe('the repository the host\'s environment names', () => {
       for (const name of GIT_LOCATION) expect(env, name).not.toHaveProperty(name)
       expect(env.GIT_CEILING_DIRECTORIES).toBe(dir)
     } finally { vi.unstubAllEnvs() }
+  })
+})
+
+/** Subprocess runtime that returns canned output: the isolated git configuration and the SSH session's greeting. */
+const canned = (git: string, ssh: string): SubprocessRuntime => ({
+  spawn: ({ argv }: { argv: readonly string[] }) => {
+    const output = argv[0] === 'git' ? git : ''
+    // `ssh -T` reports the GitLab greeting on stderr and exits with 1, so runAsWorker reads the greeting from the failure.
+    const failure = argv[0] === 'ssh' ? ssh : ''
+    const reader = (text: string) => ({ readFrom: () => ({ text, nextOffset: text.length, lossy: false }) })
+    return { done: Promise.resolve({ exitCode: argv[0] === 'ssh' ? 1 : 0 }),
+      collected: { stdout: reader(output), stderr: reader(failure) } }
+  },
+}) as unknown as SubprocessRuntime
+
+describe('GitLab worker environment', () => {
+  const signal = new AbortController().signal
+  const account = (overrides: Partial<GitlabAccount> = {}): GitlabAccount => ({ cli: '/opt/gitlab', login: 'agent-bot', email: 'agent@example.com',
+    project: 'acme/widgets', baseUrl: 'https://gitlab.example.com', ...overrides })
+  const deployment = (overrides: Partial<GitlabAccount> = {}) => ({ stateDir: dir, gitlab: account(overrides) })
+  const config = () => `file:${workerGitConfig(dir)}\0true\0`
+  it('accepts an SSH session that signs in as the deployment account', async () => {
+    await expect(verifyEnvironment(deployment(), canned(config(), 'Welcome to GitLab, @agent-bot!\n'), signal)).resolves.toBeUndefined()
+  })
+  it('refuses an SSH session that signs in as another account', async () => {
+    await expect(verifyEnvironment(deployment(), canned(config(), 'Welcome to GitLab, @someone-else!\n'), signal))
+      .rejects.toMatchObject({ code: 'gitlabSshAccount', values: { host: 'gitlab.example.com', account: 'agent-bot', actual: 'someone-else' } })
+  })
+  it('refuses a GitLab URL without a host', async () => {
+    await expect(verifyEnvironment(deployment({ baseUrl: 'gitlab.example.com' }), canned(config(), ''), signal))
+      .rejects.toMatchObject({ code: 'gitlabUrl', values: { url: 'gitlab.example.com' } })
   })
 })

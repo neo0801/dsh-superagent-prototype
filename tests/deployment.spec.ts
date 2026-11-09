@@ -4,7 +4,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { Config, executable, machineOf, resolveDeployment, resolveFeishuBot, type Machine, type Probe } from '../src/deployment.ts'
+import { Config, executable, GitlabProjectSchema, machineOf, resolveDeployment, resolveFeishuBot, type Machine, type Probe } from '../src/deployment.ts'
+import { Setup } from '../src/app/setup.ts'
+import { SettingsSchema } from '../src/policy.ts'
 import { gitEnv } from './fixtures/git.ts'
 
 const exec = promisify(execFile)
@@ -104,6 +106,48 @@ describe('setup', () => {
     await expect(resolveDeployment(machine(), { gitlab: {} }, probe, path)).rejects.toEqual(setupError('github', 'repositoryUnset'))
     await expect(resolveDeployment(machine(), { gitlab: { project: 'acme/widgets', cli: join(dir, 'missing') } }, probe, path))
       .rejects.toEqual(setupError('gitlab', 'gitlabCliMissing', { output: `${join(dir, 'missing')} is not an executable file` }))
+  })
+  it('accepts nested GitLab groups, group-granted push access and the commit email setup reads', async () => {
+    const cli = program(join(dir, 'bin', 'gitlab-answers'), '')
+    const project = 'acme/platform/widgets'
+    const encoded = 'acme%2Fplatform%2Fwidgets'
+    const answers = (user: object, permissions: object): Probe => async argv => {
+      const call = argv.slice(1).join(' ')
+      if (call === 'api /user') return JSON.stringify(user)
+      if (call === `api /projects/${encoded}`) return JSON.stringify({ path_with_namespace: project, permissions })
+      throw new Error(`unexpected call: ${call}`)
+    }
+    const agent = { username: 'Agent-Bot', commit_email: 'agent@example.com' }
+    // A project in nested groups, with Developer granted through the group rather than on the project.
+    const resolved = await resolveDeployment(machine(), { gitlab: { project, cli } },
+      answers(agent, { project_access: null, group_access: { access_level: 30 } }), path)
+    expect(resolved).toMatchObject({ repository: project, gitlab: { login: 'Agent-Bot', email: 'agent@example.com', project } })
+    // The effective role is the higher of the project and group levels.
+    await expect(resolveDeployment(machine(), { gitlab: { project, cli } },
+      answers(agent, { project_access: { access_level: 20 }, group_access: { access_level: 40 } }), path)).resolves.toMatchObject({ repository: project })
+    // Below Developer in both places the deployment may not push.
+    await expect(resolveDeployment(machine(), { gitlab: { project, cli } },
+      answers(agent, { project_access: { access_level: 20 }, group_access: { access_level: 10 } }), path))
+      .rejects.toEqual(setupError('gitlab', 'projectReadOnly', { account: 'Agent-Bot', project }))
+    // git refuses to commit without an identity, so setup needs the account's commit email.
+    await expect(resolveDeployment(machine(), { gitlab: { project, cli } },
+      answers({ username: 'Agent-Bot' }, { project_access: { access_level: 30 } }), path))
+      .rejects.toEqual(setupError('gitlab', 'gitlabNoCommitEmail', { account: 'Agent-Bot' }))
+    // The Source schema takes nested paths and still rejects a bare namespace.
+    expect(GitlabProjectSchema.parse({ project })).toMatchObject({ project })
+    expect(() => GitlabProjectSchema.parse({ project: 'acme' })).toThrow()
+  })
+  it('refuses a save that would leave both Sources naming a repository, and accepts clearing one while switching', async () => {
+    const check = (block: 'source:github' | 'source:gitlab', github: string, gitlab: string) => new Setup({
+      context: {} as never, machine: machine(), lifetime: new AbortController().signal, restart: () => {},
+    }).checkAccounts(block, SettingsSchema.parse({ sources: {
+      github: { enabled: true, config: { repository: github, cli: '' } },
+      gitlab: { enabled: true, config: { project: gitlab, cli: '' } },
+    } }))
+    // Both Sources naming a repository stops the instance, so the save that would create that state is refused.
+    await expect(check('source:gitlab', 'acme/widgets', 'acme/widgets')).rejects.toMatchObject({ code: 'repositoryAmbiguous' })
+    // Clearing the old Source is the first step of a provider switch: setup reports the missing repository on restart.
+    await expect(check('source:github', '', '')).resolves.toBeUndefined()
   })
   it('reads the Feishu bot from a bot-only lark-cli, or finds none when the Feishu Source names no CLI', async () => {
     expect(await resolveFeishuBot(machine(), {}, probe, path)).toBeUndefined()
