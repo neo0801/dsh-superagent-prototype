@@ -190,10 +190,10 @@ export async function verifyDirectory(directory: string, subprocess: SubprocessR
 /** Where a ticket's `origin` points, split the way git uses it for fetch and push. */
 interface RemoteAddress { form: 'url' | 'scp'; scheme: string; host: string; port: number; user: string; password: string; path: string }
 const repositoryPath = (path: string): string => decodeURIComponent(path).replace(/^\/+/, '').replace(/\/+$/, '').replace(/\.git$/i, '')
-/** Shows a remote without its credentials: a rejected address must not copy a password into a report. */
-const redact = (url: string): string => {
-  try { const parsed = new URL(url); return `${parsed.protocol}//${parsed.host}${parsed.pathname}` } catch { return url.replace(/^([^@/]+)@/, '***@') }
-}
+/** Shows a parsed remote without any credentials; an unparsable one is never echoed. */
+const addressText = (address: RemoteAddress): string => address.form === 'url'
+  ? `${address.scheme}://${address.host}${address.port ? `:${address.port}` : ''}/${address.path}`
+  : `${address.user ? `${address.user}@` : ''}${address.host}:${address.path}`
 function remoteAddress(text: string): RemoteAddress | undefined {
   const url = text.trim()
   try {
@@ -215,23 +215,28 @@ function remoteAddress(text: string): RemoteAddress | undefined {
  * Verifies that a ticket's `origin` fetches and pushes the deployment repository over the transport setup checked: HTTPS for
  * GitHub, answered by the credential helper setup verifies, and SSH as `git@host` for GitLab, which has no credential helper.
  * The address is read as git resolves it for a push (`git remote get-url --push --all`), so URL rewrites and `pushurl` are
- * included, and a GitHub `ssh://` address that the worker's rewrite rules leave alone is refused. A directory kept from an
- * earlier deployment is refused here too. A workspace that is not a checkout has no origin to check.
+ * included, and a GitHub `ssh://` address that the worker's rewrite rules leave alone is refused. Only a directory from which
+ * Git finds no repository at all (including a parent's) is left unchecked; a directory inside another repository checks that
+ * repository's effective origin. A workspace kept from an earlier deployment is refused here too.
  */
 export async function verifyTicketRepository(deployment: Pick<Deployment, 'github' | 'gitlab' | 'repository'>, directory: string,
   subprocess: SubprocessRuntime, signal: AbortSignal): Promise<void> {
-  if (!await lstat(join(directory, '.git')).then(() => true, () => false)) return
+  const timeout = AbortSignal.any([signal, AbortSignal.timeout(60_000)])
+  // `rev-parse --git-dir` succeeds from a subdirectory too, so this uses Git's own discovery rather than a `.git` entry.
+  const inside = await runAsWorker(subprocess, ['git', 'rev-parse', '--git-dir'], directory, timeout)
+    .then(() => true).catch((error: unknown) => { if (error instanceof CliError && error.exitCode === 128) return false; throw error })
+  if (!inside) return
   const command = ['git', 'remote', 'get-url', '--push', '--all', 'origin']
-  const output = await runAsWorker(subprocess, command, directory, AbortSignal.any([signal, AbortSignal.timeout(60_000)]))
+  const output = await runAsWorker(subprocess, command, directory, timeout)
     .catch((error: unknown) => { if (error instanceof CliError && (error.exitCode === 1 || error.exitCode === 2)) return ''; throw error })
   const urls = output.split('\n').map(line => line.trim()).filter(Boolean)
   if (!urls.length) throw new Error(`The repository in ${directory} names no origin, so a worker cannot push to ${deployment.repository}.`)
   const host = deployment.github ? 'github.com' : new URL(deployment.gitlab!.baseUrl).hostname.toLowerCase()
   const sshOnly = !deployment.github
   for (const url of urls) {
-    const shown = redact(url)
     const address = remoteAddress(url)
-    if (!address) throw new Error(`The repository in ${directory} names an origin this deployment cannot read: ${shown}.`)
+    if (!address) throw new Error(`The repository in ${directory} names an origin this deployment cannot read: <unreadable remote>.`)
+    const shown = addressText(address)
     const embedded = address.form === 'url'
       ? address.password !== '' || (address.scheme === 'ssh' ? address.user !== 'git' : address.user !== '')
       : address.user !== 'git' || address.password !== ''

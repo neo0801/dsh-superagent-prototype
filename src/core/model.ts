@@ -313,7 +313,12 @@ export interface Ticket {
  */
 export interface Follow { thread: string; own: boolean; closed?: { at: string; outcome: 'merged' | 'closed' } }
 /** Stable identity of the repository work belongs to: its provider, instance host and canonical project path. */
-export interface RepositoryIdentity { provider: 'github' | 'gitlab'; host: string; repository: string }
+export interface RepositoryIdentity {
+  /** `unknown` marks a ticket or start record migrated from a version that recorded only the repository path. */
+  provider: 'github' | 'gitlab' | 'unknown'
+  host: string
+  repository: string
+}
 export interface Execution {
   name: string; directory: string; assignment: string
   /** The repository this ticket's workspace was created for; absent on tickets accepted before it was recorded. */

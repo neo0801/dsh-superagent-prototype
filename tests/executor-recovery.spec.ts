@@ -41,8 +41,10 @@ function ticketWith(overrides: { repository?: ReturnType<typeof repositoryIdenti
 function executorFor(ticket: Ticket, options: { changed?: boolean } = {}) {
   const handlers = new Map<string, (payload: { ticketId: string; assignmentId: string }) => Promise<void>>()
   const queued: { kind: string; payload: { ticketId: string; assignmentId: string } }[] = []
-  const spawn = vi.fn((_spec: { argv: readonly string[] }) => ({ done: Promise.resolve({ exitCode: 0, signal: null }),
-    collected: { stdout: reader(''), stderr: reader('') } }))
+  const spawn = vi.fn((spec: { argv: readonly string[] }) => {
+    const output = spec.argv[0] === 'git' && spec.argv[1] === 'remote' ? 'https://github.com/acme/widgets.git\n' : ''
+    return { done: Promise.resolve({ exitCode: 0, signal: null }), collected: { stdout: reader(output), stderr: reader('') } }
+  })
   const report = vi.fn((): Ticket => { throw new Error('STOP_REPORT') })
   const ensure = vi.fn(async () => { throw new Error('STOP_ENSURE') })
   const sessions = { ensure, prompt: vi.fn(), relay: vi.fn(), holds: vi.fn(async () => false), promptedId: vi.fn((id: string) => id) }

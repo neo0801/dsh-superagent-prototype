@@ -208,6 +208,32 @@ describe('ticket directory check', () => {
     await git('-C', 'repo', 'remote', 'set-url', 'origin', 'git@github.com:acme/widgets.git')
     await expect(checkRepository()).resolves.toBeUndefined()
   })
+  it('never repeats credentials from an unparsable URL or a scp-like address', async () => {
+    const github = { repository: 'acme/widgets',
+      github: { cli: '/opt/gh', login: 'agent-bot', noreply: '7+agent-bot@users.noreply.github.com' } }
+    const checkRepository = () => verifyTicketRepository(github, join(dir, 'repo'), subprocess(join(dir, 'global')), signal)
+    await git('init', '-q', 'repo')
+    // The port is not a number, so URL parsing fails; the report shows a fixed placeholder instead of the input.
+    await git('-C', 'repo', 'remote', 'add', 'origin', 'https://agent:REVIEW_DUMMY_SECRET@github.com:bad/acme/widgets.git')
+    const malformed = await checkRepository().catch((failure: unknown) => failure)
+    expect(String(malformed)).toContain('<unreadable remote>')
+    expect(String(malformed)).not.toContain('REVIEW_DUMMY_SECRET')
+    // A scp-like address with a password keeps only its user in the report.
+    await git('-C', 'repo', 'remote', 'set-url', 'origin', 'git:REVIEW_DUMMY_SECRET@github.com:acme/widgets.git')
+    const scp = await checkRepository().catch((failure: unknown) => failure)
+    expect(String(scp)).not.toContain('REVIEW_DUMMY_SECRET')
+  })
+  it('checks the origin of the repository Git finds from a subdirectory, and skips only true empty directories', async () => {
+    const github = { repository: 'acme/widgets',
+      github: { cli: '/opt/gh', login: 'agent-bot', noreply: '7+agent-bot@users.noreply.github.com' } }
+    const checkRepository = (directory: string) => verifyTicketRepository(github, join(dir, directory), subprocess(join(dir, 'global')), signal)
+    await git('init', '-q', 'parent')
+    await git('-C', 'parent', 'remote', 'add', 'origin', 'git@github.com:acme/other-project.git')
+    mkdirSync(join(dir, 'parent', 'task-directory'), { recursive: true })
+    await expect(checkRepository(join('parent', 'task-directory'))).rejects.toThrow('pushes origin to')
+    mkdirSync(join(dir, 'plain-directory'))
+    await expect(checkRepository('plain-directory')).resolves.toBeUndefined()
+  })
   it('fails when git cannot read the repository\'s configuration, instead of passing it', async () => {
     await git('init', '-q', 'repo')
     writeFileSync(join(dir, 'repo', '.git', 'config'), '[core\n')

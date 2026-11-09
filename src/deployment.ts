@@ -101,8 +101,37 @@ export const sameRepositoryIdentity = (a: RepositoryIdentity, b: RepositoryIdent
 export const recordedRepositoryIdentity = (value: unknown): RepositoryIdentity | undefined => {
   if (typeof value !== 'object' || value === null) return undefined
   const { provider, host, repository } = value as Record<string, unknown>
-  return (provider === 'github' || provider === 'gitlab') && typeof host === 'string' && typeof repository === 'string'
+  return (provider === 'github' || provider === 'gitlab' || provider === 'unknown') && typeof host === 'string' && typeof repository === 'string'
     ? { provider, host, repository } : undefined
+}
+/** The repository path an earlier version recorded alone in `value`, which has no provider or instance. */
+export function recordedRepositoryPath(value: unknown): string | undefined {
+  if (typeof value === 'string') return value.trim() || undefined
+  if (typeof value !== 'object' || value === null) return undefined
+  const { provider, host, repository } = value as Record<string, unknown>
+  return typeof repository === 'string' && repository.trim() && (provider === undefined || host === undefined) ? repository : undefined
+}
+/**
+ * The identity to record for `recorded`, which may predate repository identities: the current one when its path is the
+ * same, otherwise an identity that can never match, so a ticket from another target stays refused. A full identity keeps
+ * its own provider and host for the comparison.
+ */
+export function migratedRepositoryIdentity(recorded: unknown, current: RepositoryIdentity): { changed: boolean; identity: RepositoryIdentity } {
+  const full = recordedRepositoryIdentity(recorded)
+  if (full) return { changed: !sameRepositoryIdentity(full, current), identity: full }
+  const path = recordedRepositoryPath(recorded)
+  if (path === undefined) return { changed: false, identity: current }
+  return sameName(path, current.repository) ? { changed: false, identity: current } : { changed: true, identity: { provider: 'unknown', host: '', repository: path } }
+}
+/**
+ * The identity to record for a ticket accepted before identities existed: a known switch binds it to the previous
+ * identity, otherwise only a matching recorded path becomes the current identity and a different one stays refused.
+ */
+export function migrateTicketIdentity(recorded: unknown, previous: unknown, current: RepositoryIdentity): RepositoryIdentity {
+  const identity = recordedRepositoryIdentity(recorded)
+  if (identity) return identity
+  const before = migratedRepositoryIdentity(previous, current)
+  return before.changed ? before.identity : migratedRepositoryIdentity(recorded, current).identity
 }
 
 /** Resolve a command name or absolute path to an executable file, ignoring the worker shim directory. */
