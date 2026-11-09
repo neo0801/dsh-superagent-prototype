@@ -5,10 +5,10 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SENSITIVE_ENV_PATTERN, type SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
-import { GIT_LOCATION, agentVariables, credentialHelper, runAsWorker, verifyDirectory, verifyEnvironment, withoutDirectory, workerBin, workerGitConfig, writeEnvironment }
+import { GIT_LOCATION, agentVariables, credentialHelper, runAsWorker, verifyDirectory, verifyEnvironment, verifyTicketRepository, withoutDirectory, workerBin, workerGitConfig, writeEnvironment }
   from '../src/infra/environment.ts'
 import { CliError } from '../src/infra/commands.ts'
-import type { GitlabAccount } from '../src/deployment.ts'
+import type { Deployment, GitlabAccount } from '../src/deployment.ts'
 import { testDeployment } from './fixtures/deployment.ts'
 import { gitEnv } from './fixtures/git.ts'
 
@@ -148,6 +148,45 @@ describe('ticket directory check', () => {
     await git('init', '-q', 'repo')
     await git('-C', 'repo', 'config', 'http.https://github.com/.extraheader', 'AUTHORIZATION: basic x')
     await expect(check('repo')).rejects.toThrow('sets http.https://github.com/.extraheader')
+  })
+  it('refuses a repository that picks its own SSH command or rewrites addresses', async () => {
+    await git('init', '-q', 'repo')
+    await git('-C', 'repo', 'config', 'core.sshCommand', 'ssh -i /home/me/.ssh/personal')
+    await expect(check('repo')).rejects.toThrow('core.sshcommand')
+    await git('-C', 'repo', 'config', '--unset', 'core.sshCommand')
+    await git('-C', 'repo', 'config', 'url.git@elsewhere.example.com:.insteadOf', 'https://gitlab.example.com/')
+    await expect(check('repo')).rejects.toThrow(/insteadof/i)
+  })
+  it('refuses a ticket directory that pushes to another repository or over an unverified transport', async () => {
+    const gitlab = { repository: 'acme/platform/widgets',
+      gitlab: { cli: '/opt/gitlab', login: 'agent-bot', email: 'agent@example.com', project: 'acme/platform/widgets', baseUrl: 'https://gitlab.example.com' } }
+    const checkRepository = (directory: string, deployment: Pick<Deployment, 'repository' | 'github' | 'gitlab'> = gitlab) =>
+      verifyTicketRepository(deployment, join(dir, directory), subprocess(join(dir, 'global')), signal)
+    await git('init', '-q', 'repo')
+    // A directory kept from a GitHub deployment: its origin cannot be used for the GitLab deployment.
+    await git('-C', 'repo', 'remote', 'add', 'origin', 'git@github.com:acme/widgets.git')
+    await expect(checkRepository('repo')).rejects.toThrow('pushes origin to')
+    // GitLab pushes over SSH, so an HTTPS origin would reach git without the identity setup checked.
+    await git('-C', 'repo', 'remote', 'set-url', 'origin', 'https://gitlab.example.com/acme/platform/widgets.git')
+    await expect(checkRepository('repo')).rejects.toThrow('no credential helper')
+    // A push URL that names another project is refused as well.
+    await git('-C', 'repo', 'remote', 'set-url', 'origin', 'git@gitlab.example.com:acme/platform/widgets.git')
+    await git('-C', 'repo', 'config', 'remote.origin.pushurl', 'git@gitlab.example.com:acme/other.git')
+    await expect(checkRepository('repo')).rejects.toThrow('pushes origin to')
+  })
+  it('accepts the deployment repository over HTTPS for GitHub and over SSH for GitLab, and refuses no origin', async () => {
+    const checkRepository = (directory: string, deployment: Pick<Deployment, 'repository' | 'github' | 'gitlab'>) =>
+      verifyTicketRepository(deployment, join(dir, directory), subprocess(join(dir, 'global')), signal)
+    await git('init', '-q', 'repo')
+    await expect(checkRepository('repo', { repository: 'acme/widgets',
+      github: { cli: '/opt/gh', login: 'agent-bot', noreply: '7+agent-bot@users.noreply.github.com' } })).rejects.toThrow('names no origin')
+    await git('-C', 'repo', 'remote', 'add', 'origin', 'https://github.com/acme/widgets.git')
+    await expect(checkRepository('repo', { repository: 'acme/widgets',
+      github: { cli: '/opt/gh', login: 'agent-bot', noreply: '7+agent-bot@users.noreply.github.com' } })).resolves.toBeUndefined()
+    await git('-C', 'repo', 'remote', 'set-url', 'origin', 'git@gitlab.example.com:acme/platform/widgets.git')
+    await expect(checkRepository('repo', { repository: 'acme/platform/widgets',
+      gitlab: { cli: '/opt/gitlab', login: 'agent-bot', email: 'agent@example.com', project: 'acme/platform/widgets', baseUrl: 'https://gitlab.example.com' } }))
+      .resolves.toBeUndefined()
   })
   it('fails when git cannot read the repository\'s configuration, instead of passing it', async () => {
     await git('init', '-q', 'repo')
