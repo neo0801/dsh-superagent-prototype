@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { Config, executable, GitlabProjectSchema, machineOf, resolveDeployment, resolveFeishuBot, type Machine, type Probe } from '../src/deployment.ts'
+import { Config, executable, GitlabProjectSchema, machineOf, repositoryIdentity, resolveDeployment, resolveFeishuBot, sameRepositoryIdentity, type Machine, type Probe } from '../src/deployment.ts'
 import { Setup } from '../src/app/setup.ts'
 import { SettingsSchema } from '../src/policy.ts'
 import { gitEnv } from './fixtures/git.ts'
@@ -136,6 +136,18 @@ describe('setup', () => {
     // The Source schema takes nested paths and still rejects a bare namespace.
     expect(GitlabProjectSchema.parse({ project })).toMatchObject({ project })
     expect(() => GitlabProjectSchema.parse({ project: 'acme' })).toThrow()
+  })
+  it('identifies a deployment repository by provider and instance, not only by its path', () => {
+    const github = repositoryIdentity({ repository: 'acme/widgets',
+      github: { cli: '/opt/gh', login: 'agent-bot', noreply: '7+agent-bot@users.noreply.github.com' } })
+    const gitlab = (baseUrl = 'https://gitlab.example.com') => repositoryIdentity({ repository: 'acme/widgets',
+      gitlab: { cli: '/opt/gitlab', login: 'agent-bot', email: 'agent@example.com', project: 'acme/widgets', baseUrl } })
+    expect(github).toEqual({ provider: 'github', host: 'github.com', repository: 'acme/widgets' })
+    expect(gitlab()).toEqual({ provider: 'gitlab', host: 'gitlab.example.com', repository: 'acme/widgets' })
+    // The same path on another provider or another instance is a different repository.
+    expect(sameRepositoryIdentity(github, gitlab())).toBe(false)
+    expect(sameRepositoryIdentity(gitlab(), gitlab('https://gitlab.other.example.com'))).toBe(false)
+    expect(sameRepositoryIdentity(gitlab(), gitlab('https://GITLAB.EXAMPLE.COM/'))).toBe(true)
   })
   it('refuses a save that would leave both Sources naming a repository, and accepts clearing one while switching', async () => {
     const check = (block: 'source:github' | 'source:gitlab', github: string, gitlab: string) => new Setup({

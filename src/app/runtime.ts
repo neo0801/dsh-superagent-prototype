@@ -17,7 +17,7 @@ import { Engine, key, reasonText, type EngineForSettings, type ReceiveResult, ty
 import { allowedSender, settingsPolicy } from '../policy.ts'
 import { SourceRegistry } from '../sources/registry.ts'
 import { Commands } from '../infra/commands.ts'
-import { providerOf, type Deployment, type Machine } from '../deployment.ts'
+import { providerOf, recordedRepositoryIdentity, repositoryIdentity, sameRepositoryIdentity, type Deployment, type Machine } from '../deployment.ts'
 import { environmentOf, ticketEnvironment, type Variable } from './execution-environment.ts'
 import type { SetupProblem } from '../setup.ts'
 import { DshExecutor, sourceTrigger, triggerMessage, workerSessionId } from '../executor/dsh.ts'
@@ -209,12 +209,23 @@ export class Runtime extends Service implements SourceHost {
       this.runtimeHealth.set({ ...health('paused', 'setupPending'), at: now() })
       return
     }
-    // Remember which repository this installation works on, so a later start after a provider switch refuses tickets that
-    // were accepted for the old one instead of resuming them against the new one.
     const resolved = this.setup.deployment
-    const previousDeployment = this.store.get(KV.runtime.deployment)
-    this.deploymentChangedFlag = previousDeployment !== undefined && previousDeployment.repository !== resolved.repository
-    if (previousDeployment?.repository !== resolved.repository) this.store.set(KV.runtime.deployment, { repository: resolved.repository })
+    // Remember the full identity of the repository this installation works on (provider, instance host and path), so a
+    // later start after a provider switch keeps refusing tickets accepted for another repository instead of resuming them.
+    const currentIdentity = repositoryIdentity(resolved)
+    const previousIdentity = recordedRepositoryIdentity(this.store.get(KV.runtime.deployment) as unknown)
+    this.deploymentChangedFlag = previousIdentity !== undefined && !sameRepositoryIdentity(previousIdentity, currentIdentity)
+    const inherited = this.deploymentChangedFlag ? previousIdentity! : currentIdentity
+    this.store.atomic(() => {
+      for (const ticket of this.store.tickets.open()) {
+        const execution = ticket.execution
+        if (!execution || recordedRepositoryIdentity(execution.repository)) continue
+        // A ticket accepted before its repository was recorded inherits the deployment it was accepted under, so the
+        // refusal survives later starts instead of lasting only the one that noticed the switch.
+        this.store.tickets.save({ ...ticket, execution: { ...execution, repository: inherited } })
+      }
+    })
+    this.store.set(KV.runtime.deployment, currentIdentity)
     this.sessions.install()
     this.executor.install()
     await this.sessions.ensure(this.masterId, this.machine.stateDir, 'dsh-superagent orchestrator', 'orchestrator')
