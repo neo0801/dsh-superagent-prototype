@@ -296,8 +296,10 @@ export class Sessions {
    * An Executor Session's tools: only the profile's work tools, which DSH requires to be known, and none once its ticket
    * ended. A failed or blocked worker keeps its tools, so a person may continue it in its Session; only automated input waits
    * (see the executor). The allow list comes from the preset's parent scope, because the global view misses preset tools and
-   * the agent's own view adds local tools such as subagent, which `restrict` refuses to name. When DSH does not expose a
-   * scope key through the context, the list stays empty and no restriction is applied at all.
+   * the agent's own view adds local tools such as subagent, which `restrict` refuses to name. When DSH exposes no scope key
+   * at all the list is empty, and `restrict` masks every inherited tool: the worker keeps only the tools registered on its
+   * own Session (the Executor's report and card tools), so it cannot act but can still report, rather than running with
+   * whatever its preset, or a subagent's `standard` preset, inherits.
    */
   private workOnly(agent: Agent, ticketId: string): (() => void)[] {
     const store = this.host.store
@@ -308,10 +310,7 @@ export class Sessions {
       const current = store.tickets.get(ticketId)
       return !current || !liveTicket(current) ? 'Ticket ended; new work needs a new authorized ticket' : undefined
     })
-    // A scope this DSH does not expose through the context leaves the allow list empty, and an empty allow list masks every
-    // inherited tool, including the preset's own shell, files and search. A worker that cannot work is worse than one whose
-    // preset, which already holds only work tools, is not narrowed further.
-    return allow.length === 0 ? [guard] : [agent.ctx.tools.restrict({ allow }), guard]
+    return [agent.ctx.tools.restrict({ allow }), guard]
   }
   /**
    * A subagent of an Executor Session, or of one of its subagents, which runs under DSH's `standard` preset with the worker's
