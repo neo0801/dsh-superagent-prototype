@@ -45,7 +45,7 @@ function executorFor(ticket: Ticket, options: { changed?: boolean } = {}) {
     const output = spec.argv[0] === 'git' && spec.argv[1] === 'remote' ? 'https://github.com/acme/widgets.git\n' : ''
     return { done: Promise.resolve({ exitCode: 0, signal: null }), collected: { stdout: reader(output), stderr: reader('') } }
   })
-  const report = vi.fn((): Ticket => { throw new Error('STOP_REPORT') })
+  const report = vi.fn((_id: string, _report: unknown): Ticket => ticket)
   const ensure = vi.fn(async () => { throw new Error('STOP_ENSURE') })
   const sessions = { ensure, prompt: vi.fn(), relay: vi.fn(), holds: vi.fn(async () => false), promptedId: vi.fn((id: string) => id) }
   const store = {
@@ -67,7 +67,7 @@ function executorFor(ticket: Ticket, options: { changed?: boolean } = {}) {
     closing: () => false, paused: () => false, environment: () => [], sourceLink: vi.fn(async () => ({})), repliedTo: () => undefined,
     deployment: () => deployment, deploymentChanged: () => options.changed ?? false,
   } as unknown as ExecutorHost
-  return { executor: new DshExecutor(host), handlers, queued, spawn, report, ensure, deliveryFailed: engine.deliveryFailed }
+  return { executor: new DshExecutor(host), handlers, queued, spawn, report, ensure, prompt: sessions.prompt, deliveryFailed: engine.deliveryFailed }
 }
 
 const privateCall = (executor: DshExecutor) => executor as unknown as {
@@ -85,9 +85,11 @@ it('refuses a launch whose ticket was accepted for another repository', async ()
 
 it('refuses a human follow-up delivery for another repository before touching its Session', async () => {
   const ticket = ticketWith({ repository: other, state: 'running' })
-  const { executor, spawn, ensure, report, deliveryFailed } = executorFor(ticket)
-  await expect(privateCall(executor).deliverQueued(ticket.id)).rejects.toThrow('STOP_REPORT')
+  const { executor, spawn, ensure, prompt, report, deliveryFailed } = executorFor(ticket)
+  // The failed report is recorded normally; the refusal must end the delivery rather than fall through to the loop.
+  await expect(privateCall(executor).deliverQueued(ticket.id)).resolves.toBeUndefined()
   expect(ensure).not.toHaveBeenCalled()
+  expect(prompt).not.toHaveBeenCalled()
   expect(spawn).not.toHaveBeenCalled()
   expect(deliveryFailed).not.toHaveBeenCalled()
   const [id, failed] = report.mock.calls[0] as unknown as [string, { state: string; summary: string }]
@@ -112,11 +114,13 @@ it('checks a recovered launch before starting the worker', async () => {
   executor.resume()
   expect(queued).toEqual([{ kind: 'launch', payload: { ticketId: ticket.id, assignmentId: 'assignment-1' } }])
   const launch = handlers.get('launch')!
-  // The stub Session refuses to start, which the launch reports as a failure after its own checks ran.
-  await expect(launch({ ticketId: ticket.id, assignmentId: 'assignment-1' })).rejects.toThrow('STOP_REPORT')
+  // The stub Session refuses to start; the launch reports that normally and stops.
+  await expect(launch({ ticketId: ticket.id, assignmentId: 'assignment-1' })).resolves.toBeUndefined()
   expect(ensure).toHaveBeenCalledTimes(1)
   expect(spawn.mock.calls.some(([spec]) => spec.argv[0] === 'git')).toBe(true)
-  expect(report).toHaveBeenCalled()
+  const [, failed] = report.mock.calls[0] as unknown as [string, { state: string; summary: string }]
+  expect(failed.state).toBe('failed')
+  expect(failed.summary).toContain('STOP_ENSURE')
 })
 
 it('refuses a recovered launch of a ticket recorded before repositories were identified', async () => {
@@ -124,7 +128,7 @@ it('refuses a recovered launch of a ticket recorded before repositories were ide
   const { executor, handlers, queued, ensure, report } = executorFor(ticket, { changed: true })
   executor.resume()
   expect(queued.map(entry => entry.kind)).toEqual(['launch'])
-  await expect(handlers.get('launch')!({ ticketId: ticket.id, assignmentId: 'assignment-1' })).rejects.toThrow('STOP_REPORT')
+  await expect(handlers.get('launch')!({ ticketId: ticket.id, assignmentId: 'assignment-1' })).resolves.toBeUndefined()
   expect(ensure).not.toHaveBeenCalled()
   const [, failed] = report.mock.calls[0] as unknown as [string, { state: string; summary: string }]
   expect(failed.state).toBe('failed')
