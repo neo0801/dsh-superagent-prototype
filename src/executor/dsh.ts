@@ -5,7 +5,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { mkdir, rmdir, stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { key, latestAssignment, latestReport, liveTicket, runningAssignment, threadKey, waitsForPerson } from '../core/index.ts'
-import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, Executor, Mandate, PolicyEffect, Ticket, TicketInput, Trigger }
+import type { AssessmentOutcome, Assignment, BenchGrantedInput, EngineForExecutor, Execution, Executor, Mandate, PolicyEffect, Ticket, TicketInput, Trigger }
   from '../core/index.ts'
 import { recordedRepositoryIdentity, repositoryIdentity, sameRepositoryIdentity, type Deployment, type Machine } from '../deployment.ts'
 import type { RepositoryIdentity } from '../core/index.ts'
@@ -18,7 +18,8 @@ import type { Sessions } from '../app/sessions.ts'
 import { WorktreeNameSchema } from '../app/assessment.ts'
 import { resultRelay } from '../app/notices.ts'
 import type { HealthEntry } from '../infra/health.ts'
-import { cancelled, collectJob, killJobs, runningJobs, stopBackground, stopSubagents, until, untilQuiet } from './background.ts'
+import { cancelled, collectJob, killJobs, runningChildren, runningJobs, stopBackground, stopSubagents, until, untilQuiet } from './background.ts'
+import { BenchWithdrawn, type BenchService } from './bench.ts'
 
 const now = (): string => new Date().toISOString()
 /** Returns the worker session ID (`worker-<ticketId>`) for a ticket. */
@@ -62,7 +63,7 @@ export interface ExecutorHost {
   readonly context: Context
   /** Where the Executor reports what happened to Assignments and Inputs. */
   readonly engine: Pick<EngineForExecutor, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed' | 'report'
-    | 'assignmentInterrupted'>
+    | 'assignmentInterrupted' | 'withdrawBench'>
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'set' | 'settings' | 'atomic' | 'afterCommit'>
   /** Durable effect queue through which launches and input deliveries run. */
   readonly effects: Pick<Effects, 'enqueue' | 'handle'>
@@ -84,6 +85,8 @@ export interface ExecutorHost {
   sourceLink(trigger: Trigger, signal?: AbortSignal): Promise<{ source_url?: string; source_url_read?: string }>
   /** Stored Trigger of the message `trigger` replies to, when it replies to one. */
   repliedTo(trigger: Trigger): Trigger | undefined
+  /** The bench devices leased to workers, which a stop revokes and a delivery re-checks; absent when none is configured. */
+  readonly bench?: Pick<BenchService, 'revokeForTicket' | 'grantValid'>
 }
 /** Looks up a ticket's origin trigger in Store. */
 export const sourceTrigger = (host: { store: Pick<Store, 'triggers'> }, ticket: Ticket): Trigger | undefined =>
@@ -154,8 +157,23 @@ function policyMessage(effect?: PolicyEffect): string {
 /** Resource path under which a worker session reads the full text of a ticket input. */
 export const inputResource = (ticketId: string, inputId: string): string => `ticket/${ticketId}/input/${key(inputId)}`
 /**
+ * What a worker reads when the host leases it a bench device: the device and its deadline, and the one command that reaches
+ * adb, whose device, server and binary it cannot choose. A call through anything else reaches no device this ticket holds.
+ */
+export function benchGrantMessage(input: BenchGrantedInput): string {
+  const command = `node ${JSON.stringify(input.wrapper)} --lease ${input.leaseId} --token ${input.token}`
+  return [
+    `The orchestrator host leased bench device ${input.deviceId} (serial ${input.serial}) to this ticket until ${input.expiresAt}.`,
+    'Run every adb action through this wrapper, and never call platform-tools adb directly or pass -s:',
+    `  ${command} shell getprop ro.build.version.release`,
+    'The wrapper refuses a call once the lease is released, revoked or expired.',
+    `Release the device with orchestrator_bench_release when the work on it is done, before reporting ready or dropped.`,
+  ].join('\n')
+}
+/**
  * Formats a ticket input for worker delivery: a `trigger` rendered via `trigger` (or by its ID and read path when absent),
- * a `policy-changed` notice, a `resumed` notice, an orchestrator `note`, or a `text` input as written.
+ * a `policy-changed` notice, a `resumed` notice, an orchestrator `note`, a bench-device grant with its wrapper command, or a
+ * `text` input as written.
  * Returns `undefined` for legacy `reopen` inputs, which are historical only because the schema 11 migration converted pending reopen inputs into text inputs.
  */
 export function inputMessage(input: TicketInput, trigger?: object): string | undefined {
@@ -165,6 +183,7 @@ export function inputMessage(input: TicketInput, trigger?: object): string | und
   if (input.kind === 'policy-changed') return policyMessage(input.effect)
   if (input.kind === 'resumed') return RESUMED
   if (input.kind === 'note') return `Note from the orchestrator, for context only: ${input.text}`
+  if (input.kind === 'bench-granted') return benchGrantMessage(input)
   return input.kind === 'text' ? input.text : undefined
 }
 /**
@@ -332,6 +351,8 @@ export class DshExecutor implements Executor {
           if (input) await this.deliverInput(ticket, assignment, input)
         } catch (error) {
           if (this.host.closing() || error instanceof Later) throw error
+          // A bench grant that stopped being valid is withdrawn, not a failed delivery: no retry, and nothing to report.
+          if (error instanceof BenchWithdrawn) { this.host.engine.withdrawBench(ticketId, [inputId]); continue }
           const current = this.host.store.tickets.get(ticketId)
           if (!current || !liveTicket(current) || runningAssignment(current)?.id !== assignment.id) return
           this.host.engine.deliveryFailed(ticketId, assignment.id, String(error))
@@ -342,12 +363,17 @@ export class DshExecutor implements Executor {
     } finally { if (woken) this.slots.free(ticketId) }
   }
   private async deliverInput(ticket: Ticket, assignment: Assignment, input: TicketInput): Promise<void> {
-    // Re-check right before session delivery because the ticket may have ended while awaiting `sourceLink`.
+    // Re-check right before session delivery because the ticket may have ended while awaiting `sourceLink`, and again inside
+    // the Session's own delivery just before the message is queued, which closes the window in which a lease is revoked.
     const live = () => {
       const current = this.host.store.tickets.get(ticket.id)
       if (!current || !liveTicket(current) || runningAssignment(current)?.id !== assignment.id) throw new Error('The ticket ended or another Assignment took it over')
       // A stop of the worker's background work that started meanwhile ends with a cancel, which would drop the Input.
       if (this.stopping.has(ticket.id)) throw new Later('The worker\'s background work is stopping')
+      // A grant released, revoked or expired while the Session was resolving is withdrawn instead: the worker never sees it.
+      if (input.kind === 'bench-granted' && !this.host.bench?.grantValid(ticket.id, input)) {
+        throw new BenchWithdrawn('The bench lease is no longer valid')
+      }
     }
     live()
     const trigger = input.kind === 'trigger' ? await this.triggerCard(ticket, input.triggerId, input.note) : undefined
@@ -376,6 +402,9 @@ export class DshExecutor implements Executor {
     const ownTurn = (report?.state === 'ready' || report?.state === 'dropped') && !busy
     const sessionId = workerSessionId(ticket.id)
     this.host.store.afterCommit(() => {
+      // The device follows the Assignment: revoke its lease first, so a wrapper call the worker still makes is refused even
+      // before its background work is stopped.
+      this.host.bench?.revokeForTicket(ticket.id, `the ticket's Assignment ended: ${reason}`)
       this.settling.get(ticket.id)?.abort()
       if (!ownTurn) this.host.context.agents.get(sessionId as SessionId)?.cancel({ kind: 'user' }, { keepInbox: false })
       // Its shell jobs and subagents stop with it, also those of a worker that ends its own turn.
@@ -417,6 +446,15 @@ export class DshExecutor implements Executor {
   }
   /** Number of open tickets whose worker holds a worker slot: its turn runs, or its shell jobs or subagents still run after its turn ended. */
   activeCount(): number { return this.host.store.tickets.open().filter(ticket => this.running(ticket)).length }
+  /**
+   * What a ticket's worker still runs in the background, which a bench release refuses to overtake: its running shell jobs and
+   * its live subagents. A release would otherwise hand a device on while the worker's own commands still reach it.
+   */
+  async backgroundOf(ticketId: string): Promise<string[]> {
+    const sessionId = workerSessionId(ticketId)
+    const jobs = runningJobs(this.host.context, sessionId).map(job => `shell job ${job.name}`)
+    return [...jobs, ...await runningChildren(this.host.context, sessionId)]
+  }
   /** Whether a ticket's worker holds a worker slot: its turn runs, or its shell jobs or subagents do after its turn ended. */
   private running(ticket: Ticket): boolean {
     if (!runningAssignment(ticket)) return false

@@ -40,6 +40,7 @@ export function inputLine(ticket: Ticket, input: TicketInput, worker = false) {
   const read = { read: inputResource(ticket.id, input.id) }
   const names = input.kind === 'trigger' || input.kind === 'resumed' ? { trigger_id: input.triggerId }
     : input.kind === 'reopen' && !worker ? { decision_id: input.decisionId }
+    : input.kind === 'bench-granted' ? { lease_id: input.leaseId, device_id: input.deviceId, serial: input.serial, expires_at: input.expiresAt }
     : input.kind !== 'text' ? read
     : input.text.length <= INPUT_TEXT ? { text: input.text }
     : { preview: preview(input.text).slice(0, INPUT_TEXT), chars: input.text.length, ...read }

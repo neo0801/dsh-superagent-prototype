@@ -62,6 +62,13 @@ export const runningJobs = (ctx: Context, sessionId: string, except?: ReadonlySe
   const jobs = registry(ctx)
   return jobs ? owned(jobs, sessionId, except).map(job => ({ id: job.id, name: named(job) })) : []
 }
+/** The live subagents of a Session, which keep working after its turn ended; a Session not loaded has none. */
+export async function runningChildren(ctx: Context, sessionId: string): Promise<string[]> {
+  const subagents = subagentsOf(ctx)
+  if (!subagents) return []
+  const children = await subagents.listChildren(sessionId).catch(() => [])
+  return children.map(child => child.id).filter(id => ctx.agents.get(id as SessionId) !== undefined)
+}
 
 /**
  * Wait until no shell job the Session owns runs; false at once when none ran, or when `signal` aborts first. The wait is

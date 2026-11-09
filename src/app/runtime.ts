@@ -11,16 +11,20 @@ import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-skill'
 import type {} from '@deepseek-ai/dsh-subprocess'
 import { mkdirSync } from 'node:fs'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import { lockSync } from 'proper-lockfile'
 import { Engine, key, reasonText, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
 import { allowedSender, settingsPolicy } from '../policy.ts'
 import { SourceRegistry } from '../sources/registry.ts'
 import { Commands } from '../infra/commands.ts'
-import { migrateTicketIdentity, migratedRepositoryIdentity, providerOf, recordedRepositoryIdentity, repositoryIdentity, type Deployment, type Machine } from '../deployment.ts'
+import { executable, migrateTicketIdentity, migratedRepositoryIdentity, providerOf, recordedRepositoryIdentity, repositoryIdentity, type Deployment, type Machine } from '../deployment.ts'
 import { environmentOf, ticketEnvironment, type Variable } from './execution-environment.ts'
 import type { SetupProblem } from '../setup.ts'
 import { DshExecutor, sourceTrigger, triggerMessage, workerSessionId } from '../executor/dsh.ts'
+import { BenchService, benchWrapperSource, writeBenchWrapper } from '../executor/bench.ts'
+import { benchAdbModuleUrl } from '../executor/bench-adb.ts'
+import { benchTools, type BenchToolsHost } from './tools/bench.ts'
+import { withoutDirectory, workerBin } from '../infra/environment.ts'
 import { ticketCard } from './cards.ts'
 import { MasterAssessor } from './assessment.ts'
 import { KV } from '../kv.ts'
@@ -50,6 +54,19 @@ import { executorTools, type ExecutorToolsHost } from './tools/executor.ts'
 // Source plugins interact with dsh-superagent exclusively through the `SourceHost` service interface.
 declare module '@deepseek-ai/cordis' { interface Context { orchestrator: SourceHost } }
 const now = (): string => new Date().toISOString()
+/**
+ * The host's adb, resolved to an absolute path before any Worker Session exists so a Worker's PATH cannot substitute another
+ * binary. A name the host cannot find stays as configured: adb is then started by name, as adb itself would be.
+ */
+function benchAdb(name: string, stateDir: string): string {
+  const shims = workerBin(stateDir), path = withoutDirectory(process.env.PATH ?? '', shims)
+  // A Windows name is usually configured without its extension, which its own PATH resolver would still add.
+  const names = process.platform === 'win32' && !/\.[a-z0-9]+$/i.test(name) ? [name, `${name}.exe`] : [name]
+  for (const candidate of names) {
+    try { return executable(candidate, path, shims) } catch { /* Not here; try the next spelling. */ }
+  }
+  return name
+}
 
 /**
  * Composition root of dsh-superagent that connects `Store`, `Setup`, `Engine`, `SourceRegistry`, `Effects`, `Outbox`, `Passes`, `Sessions`, `Settings`, `Prompts`, `DshExecutor`, and `MasterAssessor`.
@@ -66,6 +83,8 @@ export class Runtime extends Service implements SourceHost {
   readonly sessions: Sessions
   readonly settings: Settings
   readonly executor: DshExecutor
+  /** The bench devices this installation leases to workers, with the wrapper their calls go through; absent when none is configured. */
+  readonly bench?: BenchService
   readonly assessor: MasterAssessor
   readonly outbox: Outbox
   readonly engine: Engine
@@ -106,6 +125,8 @@ export class Runtime extends Service implements SourceHost {
       const prompts = this.prompts = new Prompts(store, () => machine.promptMaxChars.get(), deployed, feishu, provider)
       const masterId = this.masterId = store.get(KV.runtime.masterId) ?? `orchestrator-${key(machine.stateDir)}`
       store.set(KV.runtime.masterId, masterId)
+      // The bench devices, their wrapper and the adb they run are fixed before any Session exists: a Worker only gets the command.
+      const bench = this.bench = this.createBench(store, setup)
       const commands = this.commands = new Commands(() => setup.deployment, setup.commandEnvironment, this.lifetime)
       const board = this.board
       const effects = this.effects = new Effects(store, board)
@@ -122,16 +143,18 @@ export class Runtime extends Service implements SourceHost {
         promptVersion: id => this.sessions.promptVersion(id), mayRead: (id, revision) => this.sessions.mayRead(id, revision),
         feishuPageSize: () => feishuSettings(sources).readPageSize, sourceLink: link }
       const sessions = this.sessions = new Sessions({ context: ctx, store, prompts, effects, health: board.claim('models'), masterId,
-        lifetime: this.lifetime,
+        lifetime: this.lifetime, bench: bench !== undefined,
         closing: () => this.closing(), environment,
-        tools: (agent, ticket) => ticket ? executorTools(this.toolHost, ticket) : mainTools(this.toolHost, agent) })
+        tools: (agent, ticket) => ticket
+          ? [...executorTools(this.toolHost, ticket), ...bench ? benchTools({ bench, store }, ticket) : []]
+          : mainTools(this.toolHost, agent) })
       const policyChanged: EngineForSettings['policyChanged'] = (from, to, effects) => { this.engine.policyChanged(from, to, effects) }
       this.settings = new Settings({ store, sources, engine: { policyChanged }, health: board, context: ctx, lifetime: this.lifetime, sessions,
         sourceHost: this, setup, requestPass: () => { this.passes.request() } })
       this.executor = new DshExecutor({ context: ctx, get engine() { return runtime.engine }, store, effects, health: board.claim('worker'), machine,
         lifetime: this.lifetime, sessions, closing: () => this.closing(), paused: () => this.paused(), environment, sourceLink: link,
         deployment: () => setup.deployment, deploymentChanged: () => this.deploymentChangedFlag,
-        repliedTo: trigger => repliedTo({ store, sources }, trigger) })
+        repliedTo: trigger => repliedTo({ store, sources }, trigger), ...(bench ? { bench } : {}) })
       this.assessor = new MasterAssessor({ get engine() { return runtime.engine }, commands, get deployment() { return setup.deployment }, effects,
         settings: () => store.settings(), paused: () => this.paused(), threadContext: trigger => sources.threadContext(trigger),
         deliver: (id, text) => sessions.prompt(masterId, id, text, 'steer'), candidateCard: candidate => candidateCard(links, candidate) })
@@ -159,7 +182,8 @@ export class Runtime extends Service implements SourceHost {
       const evals = board.claim('evals', { state: 'ready', detail: 'No unavailable Eval in the last hour' })
       const evaluateDue = () => { engine.evaluateDue(); evals.set(evalsHealth(store)) }
       const passes = this.passes = new Passes({ engine: { receive: trigger => engine.receive(trigger), evaluateDue }, effects,
-        health: this.runtimeHealth, lifetime: this.lifetime, configured: () => setup.configured(), closing: () => this.closing() })
+        health: this.runtimeHealth, lifetime: this.lifetime, configured: () => setup.configured(), closing: () => this.closing(),
+        ...(bench ? { bench } : {}) })
       this.sourceDeps = { store, engine, outbox, commands, sources, get ready() { return runtime.ready },
         get deployment() { return setup.deployment }, configured: () => setup.configured(),
         get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem }, receive: trigger => passes.receive(trigger) }
@@ -202,9 +226,30 @@ export class Runtime extends Service implements SourceHost {
   private closing(): boolean { return this.closingFlag }
   /** Hold evaluation, dispatch, and outbound delivery while paused or awaiting setup; sources still record incoming triggers. */
   private paused(): boolean { return !this.setup.configured() || this.store.settings().paused }
+  /**
+   * The bench service, its generated wrapper and the adb it starts, or undefined when the configuration names no device. The
+   * adb binary is resolved here, once, so neither a Worker's PATH nor its own adb server options decide what a call runs.
+   */
+  private createBench(store: Store, setup: Setup): BenchService | undefined {
+    const config = this.machine.bench
+    if (!config) return undefined
+    const adb = benchAdb(config.adb, this.machine.stateDir)
+    if (!isAbsolute(adb)) {
+      this.ctx.logger.warn('dsh-superagent: bench adb %s is not an executable file on PATH; a wrapper call starts it by name', config.adb)
+    }
+    const wrapper = writeBenchWrapper(this.machine.stateDir, benchWrapperSource({ moduleUrl: benchAdbModuleUrl(),
+      stateDir: this.machine.stateDir, adb, ...(config.adbServerSocket ? { socket: config.adbServerSocket } : {}) }))
+    this.ctx.logger.info('dsh-superagent: bench leases %d device(s) through %s; adb %s', config.devices.length, wrapper, adb)
+    const runtime = this
+    return new BenchService({ store, get engine() { return runtime.engine }, config, adb, wrapper, stateDir: this.machine.stateDir,
+      lifetime: this.lifetime, repository: () => setup.configured() ? setup.deployment.repository : undefined,
+      background: ticketId => runtime.executor.backgroundOf(ticketId) })
+  }
   private async initialize(): Promise<void> {
     // Register management HTTP routes before setup completes so operators can fix setup problems in the UI.
     this.disposers.push(registerHttp(this.ctx, this.httpHost()))
+    // Nothing outlives a restart but an idle device: a lease of the process before this one is revoked before any grant.
+    this.bench?.recover()
     if (!await this.setup.run(this.store.settings())) {
       this.runtimeHealth.set({ ...health('paused', 'setupPending'), at: now() })
       return

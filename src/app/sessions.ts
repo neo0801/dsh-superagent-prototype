@@ -36,13 +36,17 @@ export interface SessionsHost {
   environment(ticket: Ticket): Variable[]
   /** Tools to register on the main Session (`ticket === undefined`) or on `ticket`'s worker Session. */
   tools(agent: Agent, ticket?: Ticket): Tool[]
+  /** Whether this installation leases bench devices, which only a worker's Session is told how to use. */
+  readonly bench?: boolean
 }
 
 /**
  * What Sessions registered for an agent it decorated: the releases of its prompt section, tools and skill scope, the scope
- * its skills are registered in, and the skills of one prompt revision; for a worker's subagent, only its tool limits.
+ * its skills are registered in, the skills of one prompt revision and the role they were bound for; for a worker's
+ * subagent, only its tool limits.
  */
-interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: { revision: number; dispose: () => void }; subagent?: true }
+interface SessionBinding { disposers: (() => void)[]; role?: 'orchestrator' | 'worker'; scope?: Context
+  skills?: { revision: number; dispose: () => void }; subagent?: true }
 
 /** The agent presets Executor Sessions and the main Session are created with, which the bundle's patch defines. */
 export const WORKER_PRESET = 'dsh-superagent-worker', ROUTER_PRESET = 'dsh-superagent-router'
@@ -247,7 +251,7 @@ export class Sessions {
     const master = agent.id === host.masterId
     const ticket = master ? undefined : this.ticketOf(agent)
     if (!master && !ticket) { this.limitSubagent(agent); return }
-    const binding: SessionBinding = { disposers: [] }
+    const binding: SessionBinding = { disposers: [], role: master ? 'orchestrator' : 'worker' }
     this.bindings.set(agent, binding)
     this.retryHealth.restore(agent.id, agent.session.snapshotEvents())
     if (agent.status === 'idle') this.retryHealth.clear(agent.id)
@@ -339,6 +343,12 @@ export class Sessions {
       const description = bundled?.description ?? (body.replace(/\s+/g, ' ').slice(0, 120) || 'Custom dsh-superagent operational skill.')
       disposers.push(scope.skills.register({ name: `${SKILL_PREFIX}${name}`, description, content, source: 'runtime',
         ...(bundled ? { resourceBase: { kind: 'directory' as const, path: dirname(bundled.path) } } : {}) }))
+    }
+    // Only a worker leases a bench device, and only this installation can lease one; a team skill of that name replaces it.
+    const bench = bundledSkills.bench
+    if (binding.role === 'worker' && this.host.bench && version.config.skills.bench === undefined) {
+      disposers.push(scope.skills.register({ name: `${SKILL_PREFIX}bench`, description: bench.description, content: bench.content,
+        source: 'runtime', resourceBase: { kind: 'directory' as const, path: dirname(bench.path) } }))
     }
     binding.skills = { revision: version.revision, dispose: () => { disposers.forEach(dispose => dispose()) } }
   }

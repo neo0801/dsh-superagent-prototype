@@ -1,5 +1,6 @@
 /** Coordinates periodic and on-demand orchestration passes that drive due effects and Engine evaluations. */
 import type { Engine, ReceiveResult, Trigger } from '../core/index.ts'
+import type { BenchService } from '../executor/bench.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import type { Effects } from './effects.ts'
 
@@ -8,6 +9,8 @@ export interface PassesHost {
   readonly effects: Pick<Effects, 'kick' | 'idle'>
   readonly health: HealthEntry
   readonly lifetime: AbortSignal
+  /** Bench leases whose ticket, Assignment or time ran out; every pass ends them before the devices are handed on. */
+  readonly bench?: Pick<BenchService, 'reconcile'>
   configured(): boolean
   closing(): boolean
 }
@@ -62,6 +65,8 @@ export class Passes {
   }
   private async pumpOnce(): Promise<void> {
     this.host.effects.kick()
+    // A bench lease that no longer qualifies ends here, before this pass hands its device to the next request.
+    this.host.bench?.reconcile()
     if (this.host.closing()) return
     // While processing is paused, the Engine only records the pause on active Evals so they do not expire.
     this.host.engine.evaluateDue()

@@ -47,3 +47,7 @@ Call orchestrator_report with progress, ready, blocked, failed or dropped; inclu
 Omit pr_number or use null if no PR exists; never fill it with a placeholder such as 1.
 A new PR must belong to this ticket branch and the deployment's account; adopted work uses the original source PR.
 ready means reviewed implementation with relevant checks passed.
+
+Where this installation leases bench devices, a device is held by a lease: ask for one before touching hardware, and run its commands only through the wrapper the grant names.
+Never start adb or platform-tools yourself, and never add a device or server option: the wrapper runs the granted device, and its refusal is a decision rather than a temporary error.
+Release a device you no longer need before you report, and read the release result: busy means a command is still running, needs-check means the host cannot confirm the device's state.
