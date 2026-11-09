@@ -14,7 +14,8 @@ Unavailable content never authorizes switching accounts or fetching it elsewhere
 
 Deliver the work as an MR from the ticket branch, which is the only association the host can rely on.
 Commit as `$DSH_SUPERAGENT_GITLAB_ACCOUNT` with `$DSH_SUPERAGENT_GITLAB_COMMIT_EMAIL` unless the Delivery requirements name an author, then push the branch: `git push -u origin "agent/$DSH_SUPERAGENT_NAME"`.
-Create the MR with `gitlab api --method POST /projects/<group%2Fproject>/merge_requests --field source_branch="agent/$DSH_SUPERAGENT_NAME" --field title="<title>" --field description="<description>"`, which prints the MR with its `iid` and `web_url`.
+Read the project's default branch with `gitlab api /projects/<group%2Fproject>` (its `default_branch`); use it as the target unless the assignment names another, never assuming `main`.
+Create the MR with `gitlab api --method POST /projects/<group%2Fproject>/merge_requests --field source_branch="agent/$DSH_SUPERAGENT_NAME" --field target_branch="<target branch>" --field title="<title>" --field description="<description>"`, which prints the MR with its `iid` and `web_url`.
 Later changes to the description use `--method PUT /projects/<group%2Fproject>/merge_requests/<iid> --field description="<description>"`.
 Begin its description, and every note you post, with the line `This is by an automated agent, not a human.` as the Communication section requires.
 Report the MR immediately after creating it: `orchestrator_report` with `state: progress`, the `web_url` and `iid` in the summary.
