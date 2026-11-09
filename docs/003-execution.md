@@ -79,6 +79,28 @@ Workers reach GitHub through the agent account's `gh` and Feishu through the bot
 
 These wrappers and directories establish defaults, not a security boundary. A worker can still execute a program by absolute path.
 
+### Bench devices
+
+An installation may name physical devices under `bench.devices` in its machine configuration. With none named, no wrapper is written and a Worker receives no bench tool or skill.
+
+A Worker asks for a device with `orchestrator_bench_request`, naming the capabilities it needs and optionally a device id. Requests wait in a first-in, first-out queue; one that no device can serve stays queued, and the Worker ends its turn so the grant can wake it.
+
+Before granting, the host runs `adb -s <serial> get-state` outside the database transaction. A device that does not answer `device` is `offline` and no lease is written. The grant itself is one transaction: the lease, the device's state, the request removed from the queue, and a `bench-granted` Input bound to the Assignment that asked for it. The Input carries the lease id, the token, the serial and the wrapper path.
+
+A Worker runs adb only through the generated wrapper:
+
+```sh
+node <stateDir>/bench/bench-adb.mjs --lease <lease id> --token <token> <action> ...
+```
+
+The wrapper reads the same runtime record and Ticket row as the host and runs the configured adb with the configured server socket, whatever a Worker's `PATH` or its own environment says. It refuses a call whose lease, token, Ticket, Assignment, device or action does not match the grant with exit code 2, one line on stderr and no adb process started. Otherwise it runs the action and its arguments as the granted serial's.
+
+`orchestrator_bench_release` gives the device back. The host refuses while that Worker's Session still runs shell jobs or subagents. Otherwise it marks the lease `revoking`, so the wrapper refuses new calls, waits up to two seconds for the calls registered under `stateDir/bench/calls/<lease id>/` to end, and re-reads the record before setting the device `idle`. A call still running, a failed scan, or a record another path changed first leaves the device `needs-check`, which no grant takes until a person confirms the device is free. This slice has no panel action for that confirmation, so a `needs-check` device stays out of service.
+
+The host revokes a lease itself in these cases: the Ticket ended, retried or stopped; the lease expired; a pass found the Ticket ended, waiting for a person or its Assignment over; the Worker reported `blocked` or `failed`; or the process started with the lease still recorded, because a restart says nothing about what the previous process started. A revoked lease's device becomes `needs-check`, or `offline` when a probe fails, and returns to `idle` only on a person's confirmation.
+
+The main Session has no bench tool, no bench skill and no lease list. It still reads a Ticket's Inputs and transcript and still receives the Worker's reports.
+
 ## Merging
 
 Auto-merge is governed by the **Delivery requirements** prompt. The host has no merge-specific decision logic.

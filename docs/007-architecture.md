@@ -342,6 +342,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/tools/tool.ts` | The `Tool` type, `readTool`, the `orchestrator_read` of both roles, and `AcknowledgementSchema` |
 | `src/app/tools/main.ts` | The main Session's tools |
 | `src/app/tools/executor.ts` | An Executor Session's tools |
+| `src/app/tools/bench.ts` | A Worker's bench tools, `orchestrator_bench_request` and `orchestrator_bench_release`, which act for the Assignment running at the moment of the call |
 | `src/app/http.ts` | The `/orchestrator/api` routes: the same-origin check, request limits and one status per kind of failure |
 | `src/app/api.ts` | `Api`, every route with its parameters, query, body and response, and the filters of the lists; it imports only types, so the panel bundles it |
 | `src/app/views/text.ts` | The two forms of a view's text: `preview`, plain text on one line, and `markdown` without HTML; `plain` and `readable` |
@@ -353,6 +354,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/views/overview.ts` | The overview: Tickets that need a person, problems, the last day's flow and the Executor's load |
 | `src/executor/dsh.ts` | The DshExecutor, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions` |
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents`, `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
+| `src/executor/bench.ts` | The BenchService: the devices, the FIFO of requests, exclusive leases and their revocation, the `bench-granted` Input a grant delivers, the release that waits for a call still in flight, `recover` and `reconcile`, and `benchWrapperSource` and `writeBenchWrapper`, which write `<stateDir>/bench/bench-adb.mjs` |
+| `src/executor/bench-authorize.ts` | The stored bench runtime (`BenchRuntime`: devices, queue, leases and retired evidence), `benchEligible`, the credentials and refusals both the host and the wrapper apply, and `parseBenchCall`, which splits a wrapper's arguments into a credential and an adb action |
+| `src/executor/bench-adb.ts` | What the generated wrapper runs: `runBenchAdb`, the call registry under `stateDir/bench/calls/`, `probeAdb`, the host's `adb -s <serial> get-state`, `adbEnvironment`, `benchAdbModuleUrl`, and `readSnapshot`, which reads the Store's database read-only |
 | `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. `CliError` carries the code a command's output reports, such as a GitHub HTTP status, and a command that prints nothing fails with how it ended, never with its arguments; `validItems` skips and counts the malformed items of a list |
 | `src/infra/environment.ts` | The agent's process environment: command shims for the deployment's CLIs, the git configuration and, on GitHub, its credential helper, `runAsWorker`, and the checks of the environment, of a Ticket's directory and of the repository its `origin` pushes to |
 | `src/infra/paths.ts` | The package's root, where packaged files are |
@@ -414,6 +418,10 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
 | `tests/assessment.spec.ts` | What the MasterAssessor keeps per Eval, and when it lets go |
 | `tests/background.spec.ts` | Waiting for a worker's shell jobs and subagents: an end that woke it, and a host that stops |
+| `tests/bench.spec.ts` | The BenchService on a real Store: configuration validation, FIFO requests and grants, an offline probe, revocation, a release with calls in flight, `reconcile`, recovery after a restart, a changed configuration's retired evidence, `clear` and `view` |
+| `tests/bench-tools.spec.ts` | The worker's bench tools: their schemas, the Assignment taken when they execute, every result they map, and the withdrawn grant that `DshExecutor` drops without a failed delivery |
+| `tests/bench-adb.spec.ts` | The wrapper's parser and every refusal, the call registry, `adbEnvironment`, `probeAdb`, the built `bench-adb` entry, and the generated wrapper run as a process |
+| `tests/bench-runtime.spec.ts` | What a Runtime assembles: the lease tools and the skill on a worker only, none without devices, a team skill of that name replacing the packaged one, and a queued request that holds no device and no worker slot |
 | `tests/bundle-patch.spec.ts` | The bundle's patch, read as DeepSeek Harness reads it, and the agent preset of Executor Sessions it defines |
 | `tests/effects.spec.ts` | The effect queue: coalescing, limits, retries with backoff, health and shutdown |
 | `tests/passes.spec.ts` | Passes: one at a time, the ones asked for during a pass run as one after it, and the runtime health a failed pass reports |
@@ -479,6 +487,7 @@ A generated column is computed from its row's JSON and is empty outside its set,
 | Session prompt history | `session-prompts:<session id>` |
 | Source state | Read positions such as `github-cursor:<number>`, PR CI fingerprints and seen Feishu-topic messages; keys begin with the kind or `thread-` plus a Thread key |
 | Display names | `source-labels:<source id>` |
+| Bench | `bench:runtime`, the devices with their state, the requests waiting in order, the leases, and the evidence a configuration change or a restart left |
 
 Dismissal is stored on its Decision. Input text is rendered from the Ticket when read, so neither needs a separate key-value record.
 
@@ -531,6 +540,10 @@ Each Executor has six application tools:
 | `orchestrator_trigger_handback` | Hand back a message once, with a reason carried by its candidate |
 
 A hand-back returns `queued: false` if another Ticket still owns the message, or this Ticket never owned it. For example, a bot message went to Eval independently.
+
+An installation whose configuration names bench devices gives each Executor two more tools, `orchestrator_bench_request` and `orchestrator_bench_release`, and the bench skill. Both tools act for the Assignment running at the moment of the call, so a request or a release left over from an ended Assignment is refused. The main Session receives neither tool nor the skill, and reads a grant only as a Ticket Input.
+
+`tests/model-surface.spec.ts` checks the surface of an installation that names no device, which is what that suite configures.
 
 The worker preset is defined in `cordis.patch.yml` and selected through `WORKER_PRESET`. `WORK_TOOLS` in `src/app/sessions.ts` retains available file, search, shell, job, web, skill, todo and subagent tools. Workers do not receive tools for asking or presenting to a person, changing the profile, scheduling work outside worker slots, starting or messaging other Sessions, or editing external documents. Tool calls are refused after the Ticket ends.
 
@@ -606,7 +619,7 @@ Most built-in instructions live in `prompts/*.md`, with one sentence per line jo
 
 ## Configuration reload
 
-Every plugin configuration key except `stateDir` is volatile. The panel's Deployment settings and DeepSeek Harness's Plugin Manager edit them through DeepSeek Harness's configuration form; the host writes `cordis.patch.yml` and updates the values in place, and dsh-superagent reads each limit when it uses it, so a change applies without a restart.
+Every plugin configuration key except `stateDir` and `bench` is volatile. The panel's Deployment settings and DeepSeek Harness's Plugin Manager edit them through DeepSeek Harness's configuration form; the host writes `cordis.patch.yml` and updates the values in place, and dsh-superagent reads each limit when it uses it, so a change applies without a restart. `bench` is read once at start, because it fixes the adb, the server socket and the generated wrapper that every grant names; a change needs a restart.
 
 A settings save that changes a Source field setup reads, such as an account's CLI, and any save while setup waits, restarts dsh-superagent. DeepSeek Harness's settings service does not serve the entry during that restart, so after its own restart dsh-superagent asks it to read the entry again, and an open form becomes editable again.
 

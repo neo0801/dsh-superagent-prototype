@@ -107,8 +107,39 @@ Copy [examples/profile.cordis.patch.yml](../examples/profile.cordis.patch.yml) t
 | --- | --- | --- |
 | `stateDir` | yes | Absolute path: the database, the lock, the command shims in `worker-bin`, the agent's git configuration and, by default, the Ticket directories in `work`. Back it up before upgrades |
 | `promptMaxChars`, `admissionContextMaxPages`, `admissionContextTimeoutMs` | no | The largest saved prompt configuration, and how many Thread pages one assessment reads within what time |
+| `bench` | no | The physical devices this installation leases to its Workers, and the adb binary and server that reach them, described below |
 
-After the first start, edit machine limits in **Settings → Deployment** or the DeepSeek Harness Plugin Manager. Changes apply without restart. `stateDir` cannot be changed there. Invalid values or unknown configuration keys prevent startup; the log identifies the key.
+After the first start, edit machine limits in **Settings → Deployment** or the DeepSeek Harness Plugin Manager. Changes apply without restart. `stateDir` cannot be changed there, and `bench` is set in `cordis.patch.yml` and read once at start. Invalid values or unknown configuration keys prevent startup; the log identifies the key.
+
+### Bench devices
+
+An installation that rents out physical Android devices adds a `bench` block to `cordis.patch.yml`:
+
+```yaml
+bench:
+  adb: /opt/android/platform-tools/adb
+  adbServerSocket: tcp:127.0.0.1:5037
+  leaseSeconds: 1800
+  devices:
+    - id: bench-a
+      serial: R58M123456A
+      projects: [group/project]
+      capabilities: [android-13, camera]
+      actions: [shell, install, push, pull, logcat, exec-out]
+      maintainer: 张工
+```
+
+`devices` empty or absent turns the feature off: no wrapper is written, and no Worker gets a bench tool or skill.
+
+- `adb` is a command name or an absolute path. An absolute path is the supported form: it is what the wrapper and the host's probe start. A name resolves once at start against the host's `PATH` and, if it cannot be found, is used as given.
+- `adbServerSocket` accepts `tcp:<host>:<port>` or `localfilesystem:<path>`; a bare `<host>:<port>` becomes `tcp:<host>:<port>`. The host sets `ADB_SERVER_SOCKET` from it and clears `ANDROID_ADB_SERVER_ADDRESS` and `ANDROID_ADB_SERVER_PORT` for both its probe and the wrapper.
+- `projects` empty means the device serves any repository; otherwise the deployment's repository must be listed.
+- `capabilities` are free-form names a Worker may ask for, such as `android-13`.
+- `actions` lists the adb device commands the device may run, such as `shell`, `install`, `push`, `pull` and `logcat`. `am`, `pm` and `getprop` go through `shell`. Server-wide commands, such as `start-server`, `kill-server`, `devices`, `connect` and `pair`, are refused at startup.
+- `leaseSeconds` is between 60 and 86400, defaulting to 1800.
+- The block is read once at start, so a change needs a restart.
+
+At start, a configured installation writes `<stateDir>/bench/bench-adb.mjs`, the wrapper through which Workers reach a leased device, and creates `<stateDir>/bench/calls/`, where a running call registers itself. The leases and the waiting requests live in the database under the `bench:runtime` key, so back up `orchestrator.sqlite` with the state directory. [003 Execution](003-execution.md) describes what a Worker gets and how it gives the device back.
 
 ## Start and stop
 
