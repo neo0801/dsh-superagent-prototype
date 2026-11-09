@@ -21,5 +21,5 @@ Report the MR immediately after creating it: `orchestrator_report` with `state: 
 `pr_number` binds a GitHub pull request and is refused on GitLab, so leave it out and keep the MR URL in the summary instead.
 
 Pipelines report through `gitlab api /projects/<group%2Fproject>/merge_requests/<iid>/pipelines`; a red pipeline is a finding to assess and fix within the assignment, never a reason to widen it.
-A person merges the MR: never merge it, enable auto-merge, or close GitLab issues yourself, and say a person must merge it when you report ready.
+A person merges the MR: never merge it, enable auto-merge, close GitLab issues, or post private Feishu content on GitLab yourself; say a person must merge it when you report ready.
 Answer a review note with a note on the MR (`gitlab api --method POST /projects/<group%2Fproject>/merge_requests/<iid>/notes --field body="<text>"`) when the outcome needs a reply, and state the disposition in `orchestrator_report`.
