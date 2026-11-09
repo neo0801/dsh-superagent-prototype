@@ -12,6 +12,8 @@ Plugin configuration holds the state directory and machine limits. Use the panel
 
 Exactly one Source names the deployment repository: set the GitHub Source's repository, or the GitLab Source's project, never both. The other Source stays paused (`sourceElsewhere`).
 
+Switching providers is a deployment change, not a recovery: clear the old Source's repository or project first, save, then name the new one. Every ticket records the repository it was accepted for, so a ticket accepted for the old repository refuses to resume, and a ticket directory whose `origin` pushes elsewhere is refused too. End or let the old tickets finish first, and start new tickets for the new repository.
+
 ### Permissions and isolation
 
 The bundle defines `dsh-superagent-worker` for Executors and `dsh-superagent-router` for the main Session. They appear in the DeepSeek Harness preset list but are intended only for dsh-superagent. Do not select them for personal Sessions or disable their configuration rows. The application needs them to create and resume its Sessions.
@@ -282,6 +284,8 @@ Setup problems appear on the overview with a link to the fix, in the panel's lan
 | `The agent GitLab CLI reported no commit email for @…` | Set a commit email on that GitLab account |
 | `SSH to … signs in as … instead of @…` | Register the agent account's SSH key with the operator's SSH configuration, and connect once by hand so the instance's host key is known |
 | `The GitLab URL … does not name a host` | Set the GitLab instance's root URL, such as `https://gitlab.example.com` |
+| A Ticket fails with `This ticket was accepted for …` | The deployment repository changed; start a new ticket for the new repository |
+| A Ticket fails with `The repository in … pushes origin to …` | Its directory belongs to another repository; start a new ticket, and remove the old directory after its ticket ended |
 | A Ticket fails with `The git configuration of the repository in … sets …` | Remove the named credential or `http.*.extraheader` settings from the clone's `.git/config` |
 | `… was not written by dsh-superagent` | Move the named file out of `<stateDir>/worker-bin` or `<stateDir>/worker-gitconfig`, or choose another `stateDir` |
 | `The bot lark-cli allows user identities` | Point the Feishu Source at a bot-only configuration, as in Feishu bot above |
