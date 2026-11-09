@@ -7,7 +7,9 @@ import s from '@deepseek-ai/schemastery'
 import { z } from 'zod'
 import type { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import { runAsWorker, sameDirectory, withoutDirectory, workerBin } from './infra/environment.ts'
+import { sameName } from './infra/text.ts'
 import { SetupError } from './setup.ts'
+import type { RepositoryIdentity } from './core/index.ts'
 
 const reason = (error: unknown): string => error instanceof Error ? error.message : String(error)
 const absolute = (description: string) => s.string().pattern(/^(\/|[A-Za-z]:[\\/])/).description(`${description} Absolute path.`)
@@ -86,6 +88,22 @@ export function gitlabAccount(deployment: { gitlab?: GitlabAccount }): GitlabAcc
 }
 /** The account name the deployment acts as, whichever provider runs it. */
 export const accountName = (deployment: Deployment): string => deployment.github?.login ?? deployment.gitlab?.login ?? ''
+/** The identity of the deployment repository; the same path on another provider or instance is another repository. */
+export const repositoryIdentity = (deployment: Pick<Deployment, 'repository' | 'github' | 'gitlab'>): RepositoryIdentity => ({
+  provider: providerOf(deployment),
+  host: deployment.github ? 'github.com' : new URL(deployment.gitlab!.baseUrl).hostname.toLowerCase(),
+  repository: deployment.repository,
+})
+/** Whether two identities name the same provider, instance and repository. */
+export const sameRepositoryIdentity = (a: RepositoryIdentity, b: RepositoryIdentity): boolean =>
+  a.provider === b.provider && sameName(a.host, b.host) && sameName(a.repository, b.repository)
+/** Reads a recorded identity, and nothing from earlier versions that recorded only the repository path. */
+export const recordedRepositoryIdentity = (value: unknown): RepositoryIdentity | undefined => {
+  if (typeof value !== 'object' || value === null) return undefined
+  const { provider, host, repository } = value as Record<string, unknown>
+  return (provider === 'github' || provider === 'gitlab') && typeof host === 'string' && typeof repository === 'string'
+    ? { provider, host, repository } : undefined
+}
 
 /** Resolve a command name or absolute path to an executable file, ignoring the worker shim directory. */
 export function executable(name: string, path: string, exclude?: string): string {

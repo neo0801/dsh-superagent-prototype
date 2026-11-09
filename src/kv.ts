@@ -4,6 +4,7 @@
  */
 import type { PromptVersion } from './app/prompts.ts'
 import type { SettingsVersion } from './app/store.ts'
+import type { RepositoryIdentity } from './core/index.ts'
 import type { SettingsSave } from './policy.ts'
 import type { Retry } from './sources/github.ts'
 
@@ -29,8 +30,8 @@ export const KV = {
   prompts: { revision: record<number>('prompt-revision'), version: family<PromptVersion, [revision: number]>('prompt-version:'),
     /** The built-in text of a prompt part an override was edited from, by its `base`, which shows what an upgrade changed. */
     builtIn: family<string, [base: string]>('prompt-built-in:') },
-  /** Runtime: the main Session's ID, and the deployment repository the previous start worked on. */
-  runtime: { masterId: record<string>('master-id'), deployment: record<{ repository: string }>('deployment') },
+  /** Runtime: the main Session's ID, and the repository identity the previous start worked on. */
+  runtime: { masterId: record<string>('master-id'), deployment: record<RepositoryIdentity>('deployment') },
   /** Sessions: prompt revisions each Session has worked under, ordered oldest first; the last entry (`.at(-1)`) is its active revision. */
   sessions: { prompts: family<number[], [session: string]>('session-prompts:') },
   /** Schema 11 migration: legacy main-Session queues imported into the effect table. */

@@ -7,9 +7,8 @@ import { dirname, join } from 'node:path'
 import { key, latestAssignment, latestReport, liveTicket, runningAssignment, threadKey, waitsForPerson } from '../core/index.ts'
 import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, Executor, Mandate, PolicyEffect, Ticket, TicketInput, Trigger }
   from '../core/index.ts'
-import type { Deployment, Machine } from '../deployment.ts'
+import { recordedRepositoryIdentity, repositoryIdentity, sameRepositoryIdentity, type Deployment, type Machine } from '../deployment.ts'
 import { runAsWorker, verifyDirectory, verifyTicketRepository } from '../infra/environment.ts'
-import { sameName } from '../infra/text.ts'
 import type { Settings } from '../policy.ts'
 import type { Store } from '../app/store.ts'
 import { Later, type Effects } from '../app/effects.ts'
@@ -242,7 +241,7 @@ export class DshExecutor implements Executor {
   /** Populates a newly accepted ticket's `execution` attributes (worktree name, workspace directory, assignment text and repository). */
   prepare(ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>): Ticket {
     return { ...ticket, execution: { ...ticketExecution(ticket, outcome, this.host.store.settings(), this.host.machine.stateDir),
-      repository: this.host.deployment().repository } }
+      repository: repositoryIdentity(this.host.deployment()) } }
   }
   /**
    * Runs the configured `executor.prepare` command for a new ticket workspace in its parent directory with the ticket's
@@ -298,6 +297,16 @@ export class DshExecutor implements Executor {
     const first = this.host.store.tickets.get(ticketId)
     const target = first && liveTicket(first) ? runningAssignment(first) : undefined
     if (!first || !target || !first.undelivered.length) return
+    // Delivering human input can start a worker just as a launch does, so it checks the same repository and workspace first.
+    const deployment = this.host.deployment()
+    try {
+      this.assertTicketRepository(first, deployment)
+      await this.verifyWorkspace(first.execution?.directory ?? '', deployment)
+    } catch (error) {
+      if (this.host.closing()) throw error
+      this.failed(ticketId, String(error))
+      return
+    }
     let woken = false
     try {
       for (;;) {
@@ -426,6 +435,27 @@ export class DshExecutor implements Executor {
     })
   }
   private relay({ id, text }: { id: string; text: string }): void { this.host.sessions.relay(id, text) }
+  /**
+   * Refuses a ticket accepted for another provider, instance or repository before any Session, environment or workspace uses
+   * it. Used by every entry that can start or continue a worker: launches, recovered launches and deliveries of human input.
+   */
+  private assertTicketRepository(ticket: Ticket, deployment: Deployment): void {
+    const recorded = recordedRepositoryIdentity(ticket.execution?.repository)
+    if (recorded === undefined) {
+      if (this.host.deploymentChanged()) throw new Error('This ticket was accepted before its repository was recorded, and this start found a different deployment repository; start a new ticket instead of resuming this one.')
+      return
+    }
+    const current = repositoryIdentity(deployment)
+    if (!sameRepositoryIdentity(recorded, current)) {
+      throw new Error(`This ticket was accepted for ${recorded.provider} ${recorded.host}/${recorded.repository}, but this deployment works on ${current.provider} ${current.host}/${current.repository}; start a new ticket instead of resuming this one.`)
+    }
+  }
+  /** Checks what the worker's git would read and push in `directory`; a workspace that is not a checkout has no origin to check. */
+  private async verifyWorkspace(directory: string, deployment: Deployment): Promise<void> {
+    if (!await stat(directory).then(() => true, () => false)) return
+    await verifyDirectory(directory, this.host.context.subprocess, this.host.lifetime)
+    await verifyTicketRepository(deployment, directory, this.host.context.subprocess, this.host.lifetime)
+  }
   private async launch(ticket: Ticket, assignment: Assignment): Promise<void> {
     const current = () => {
       if (this.host.closing()) throw new Error('dsh-superagent is stopping')
@@ -435,10 +465,7 @@ export class DshExecutor implements Executor {
     }
     const deployment = this.host.deployment()
     // A ticket belongs to the repository it was accepted for; a provider switch must not resume it against the new one.
-    const recorded = ticket.execution?.repository
-    if (recorded === undefined ? this.host.deploymentChanged() : !sameName(recorded, deployment.repository)) {
-      throw new Error(`This ticket was accepted for ${recorded ?? 'an earlier deployment'}, but this deployment works on ${deployment.repository}; start a new ticket instead of resuming this one.`)
-    }
+    this.assertTicketRepository(ticket, deployment)
     const source = sourceTrigger(this.host, ticket)
     const workspace = ticket.execution?.directory ?? ''
     if (!current()) return
@@ -449,8 +476,7 @@ export class DshExecutor implements Executor {
     }
     if (!current()) return
     // The directory may predate a deployment change, so check what the worker's git would read and push before any Session uses it.
-    await verifyDirectory(workspace, this.host.context.subprocess, this.host.lifetime)
-    await verifyTicketRepository(deployment, workspace, this.host.context.subprocess, this.host.lifetime)
+    await this.verifyWorkspace(workspace, deployment)
     if (!current()) return
     const sessionId = workerSessionId(ticket.id)
     const agent = await this.host.sessions.ensure(sessionId, workspace, ticket.title, 'worker')

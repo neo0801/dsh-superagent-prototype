@@ -312,10 +312,12 @@ export interface Ticket {
  * Thread closed; the ticket then ends unless its work has not finished (see `Tickets.unfinished`).
  */
 export interface Follow { thread: string; own: boolean; closed?: { at: string; outcome: 'merged' | 'closed' } }
+/** Stable identity of the repository work belongs to: its provider, instance host and canonical project path. */
+export interface RepositoryIdentity { provider: 'github' | 'gitlab'; host: string; repository: string }
 export interface Execution {
   name: string; directory: string; assignment: string
-  /** The deployment repository this ticket's workspace was created for; absent on tickets accepted before it was recorded. */
-  repository?: string
+  /** The repository this ticket's workspace was created for; absent on tickets accepted before it was recorded. */
+  repository?: RepositoryIdentity
 }
 
 /** Whether a ticket is open: it has not ended. */
