@@ -8,6 +8,7 @@ import { key, latestAssignment, latestReport, liveTicket, runningAssignment, thr
 import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, Executor, Mandate, PolicyEffect, Ticket, TicketInput, Trigger }
   from '../core/index.ts'
 import { recordedRepositoryIdentity, repositoryIdentity, sameRepositoryIdentity, type Deployment, type Machine } from '../deployment.ts'
+import type { RepositoryIdentity } from '../core/index.ts'
 import { runAsWorker, verifyDirectory, verifyTicketRepository } from '../infra/environment.ts'
 import type { Settings } from '../policy.ts'
 import type { Store } from '../app/store.ts'
@@ -446,8 +447,10 @@ export class DshExecutor implements Executor {
       return
     }
     const current = repositoryIdentity(deployment)
+    const label = (identity: RepositoryIdentity): string => identity.provider === 'unknown'
+      ? `an earlier repository (${identity.repository})` : `${identity.provider} ${identity.host}/${identity.repository}`
     if (!sameRepositoryIdentity(recorded, current)) {
-      throw new Error(`This ticket was accepted for ${recorded.provider} ${recorded.host}/${recorded.repository}, but this deployment works on ${current.provider} ${current.host}/${current.repository}; start a new ticket instead of resuming this one.`)
+      throw new Error(`This ticket was accepted for ${label(recorded)}, but this deployment works on ${label(current)}; start a new ticket instead of resuming this one.`)
     }
   }
   /** Checks what the worker's git would read and push in `directory`; a workspace that is not a checkout has no origin to check. */

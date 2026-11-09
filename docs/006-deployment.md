@@ -246,7 +246,7 @@ The process environment that setup writes:
 
 A file in `worker-bin` or `worker-gitconfig` that dsh-superagent did not write stops setup. A Ticket directory inside a git repository whose own configuration adds credentials fails the Ticket.
 
-Every launch of a Ticket's directory is checked the way the worker's git would read it: its local configuration may set no credential helper, HTTP extraheader, `core.sshCommand` or URL rewrite, and, when the directory is a checkout, its `origin` must push the deployment repository — over HTTPS for GitHub, whose credential helper setup verifies, or over SSH as `git@<instance host>` for GitLab. Git resolves the push URL first, so URL rewrites and `pushurl` are included; a GitHub `ssh://` address that the worker's rewrite rules leave alone is refused. A directory kept from another repository, such as after a provider switch, fails the Ticket instead of working on the new repository.
+Every launch of a Ticket's directory is checked the way the worker's git would read it: its local configuration may set no credential helper, HTTP extraheader, `core.sshCommand` or URL rewrite, and, when Git finds a repository from the directory (its own or a parent's), its effective push URL must name the deployment repository — over HTTPS for GitHub, whose credential helper setup verifies, or over SSH as `git@<instance host>` for GitLab. Git resolves the push URL first, so URL rewrites and `pushurl` are included; a GitHub `ssh://` address that the worker's rewrite rules leave alone is refused. Only a directory from which Git finds no repository keeps the empty-workspace behaviour. A directory kept from another repository, such as after a provider switch, fails the Ticket instead of working on the new repository.
 
 ## Try it
 

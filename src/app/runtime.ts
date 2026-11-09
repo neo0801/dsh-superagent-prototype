@@ -17,7 +17,7 @@ import { Engine, key, reasonText, type EngineForSettings, type ReceiveResult, ty
 import { allowedSender, settingsPolicy } from '../policy.ts'
 import { SourceRegistry } from '../sources/registry.ts'
 import { Commands } from '../infra/commands.ts'
-import { providerOf, recordedRepositoryIdentity, repositoryIdentity, sameRepositoryIdentity, type Deployment, type Machine } from '../deployment.ts'
+import { migrateTicketIdentity, migratedRepositoryIdentity, providerOf, recordedRepositoryIdentity, repositoryIdentity, type Deployment, type Machine } from '../deployment.ts'
 import { environmentOf, ticketEnvironment, type Variable } from './execution-environment.ts'
 import type { SetupProblem } from '../setup.ts'
 import { DshExecutor, sourceTrigger, triggerMessage, workerSessionId } from '../executor/dsh.ts'
@@ -213,16 +213,17 @@ export class Runtime extends Service implements SourceHost {
     // Remember the full identity of the repository this installation works on (provider, instance host and path), so a
     // later start after a provider switch keeps refusing tickets accepted for another repository instead of resuming them.
     const currentIdentity = repositoryIdentity(resolved)
-    const previousIdentity = recordedRepositoryIdentity(this.store.get(KV.runtime.deployment) as unknown)
-    this.deploymentChangedFlag = previousIdentity !== undefined && !sameRepositoryIdentity(previousIdentity, currentIdentity)
-    const inherited = this.deploymentChangedFlag ? previousIdentity! : currentIdentity
+    const previousRaw = this.store.get(KV.runtime.deployment) as unknown
+    const previous = migratedRepositoryIdentity(previousRaw, currentIdentity)
+    this.deploymentChangedFlag = previous.changed
     this.store.atomic(() => {
       for (const ticket of this.store.tickets.open()) {
         const execution = ticket.execution
         if (!execution || recordedRepositoryIdentity(execution.repository)) continue
-        // A ticket accepted before its repository was recorded inherits the deployment it was accepted under, so the
-        // refusal survives later starts instead of lasting only the one that noticed the switch.
-        this.store.tickets.save({ ...ticket, execution: { ...execution, repository: inherited } })
+        // A ticket accepted before its repository was recorded inherits the deployment it was accepted under. When a
+        // switch is known, that is the previous identity; otherwise a different recorded path stays refused and only a
+        // matching one becomes the current identity.
+        this.store.tickets.save({ ...ticket, execution: { ...execution, repository: migrateTicketIdentity(execution.repository, previousRaw, currentIdentity) } })
       }
     })
     this.store.set(KV.runtime.deployment, currentIdentity)

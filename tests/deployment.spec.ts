@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { Config, executable, GitlabProjectSchema, machineOf, repositoryIdentity, resolveDeployment, resolveFeishuBot, sameRepositoryIdentity, type Machine, type Probe } from '../src/deployment.ts'
+import { Config, executable, GitlabProjectSchema, machineOf, migrateTicketIdentity, migratedRepositoryIdentity, recordedRepositoryPath, repositoryIdentity, resolveDeployment, resolveFeishuBot, sameRepositoryIdentity, type Machine, type Probe } from '../src/deployment.ts'
 import { Setup } from '../src/app/setup.ts'
 import { SettingsSchema } from '../src/policy.ts'
 import { gitEnv } from './fixtures/git.ts'
@@ -148,6 +148,23 @@ describe('setup', () => {
     expect(sameRepositoryIdentity(github, gitlab())).toBe(false)
     expect(sameRepositoryIdentity(gitlab(), gitlab('https://gitlab.other.example.com'))).toBe(false)
     expect(sameRepositoryIdentity(gitlab(), gitlab('https://GITLAB.EXAMPLE.COM/'))).toBe(true)
+  })
+  it('keeps a ticket from an earlier version refused when its recorded path names another repository', () => {
+    const current = repositoryIdentity({ repository: 'acme/new-project',
+      gitlab: { cli: '/opt/gitlab', login: 'agent-bot', email: 'agent@example.com', project: 'acme/new-project', baseUrl: 'https://gitlab.example.com' } })
+    expect(migratedRepositoryIdentity('acme/new-project', current)).toEqual({ changed: false, identity: current })
+    // A path alone is enough to notice the switch, even without the old provider or instance.
+    expect(migratedRepositoryIdentity({ repository: 'acme/old-project' }, current)).toEqual({ changed: true,
+      identity: { provider: 'unknown', host: '', repository: 'acme/old-project' } })
+    expect(recordedRepositoryPath({ repository: 'acme/old-project' })).toBe('acme/old-project')
+    expect(recordedRepositoryPath(current)).toBeUndefined()
+    // A ticket from the old path is never rewritten into the current repository's authorization.
+    const previous = { repository: 'acme/old-project' }
+    expect(migrateTicketIdentity({ repository: 'acme/old-project' }, previous, current))
+      .toEqual({ provider: 'unknown', host: '', repository: 'acme/old-project' })
+    expect(migrateTicketIdentity('acme/new-project', previous, current)).toEqual({ provider: 'unknown', host: '', repository: 'acme/old-project' })
+    const matching = { repository: 'acme/new-project' }
+    expect(migrateTicketIdentity('acme/new-project', matching, current)).toEqual(current)
   })
   it('refuses a save that would leave both Sources naming a repository, and accepts clearing one while switching', async () => {
     const check = (block: 'source:github' | 'source:gitlab', github: string, gitlab: string) => new Setup({
