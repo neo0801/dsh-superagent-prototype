@@ -529,6 +529,63 @@ describe('reconcile (B12, B26)', () => {
     expect(service.runtime().devices['bench-a']?.state).toBe('needs-check')
     expect(service.runtime().leases[held.lease.leaseId]?.state).toBe('revoked')
   })
+  it('keeps the device for a person when the lease expires while the release waits', async () => {
+    const store = openStore()
+    const { service } = rig(store, { probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    const held = grantedOf(await service.request('t1', 'a1'))
+    const calls = join(directory, 'bench', 'calls', held.lease.leaseId)
+    mkdirSync(calls, { recursive: true })
+    writeFileSync(join(calls, 'in-flight'), '')
+    const pending = service.release('t1', 'a1', { leaseId: held.lease.leaseId })
+    for (let attempt = 0; attempt < 100 && service.runtime().leases[held.lease.leaseId]?.state !== 'revoking'; attempt++) await sleep(5)
+    expect(service.runtime().leases[held.lease.leaseId]?.state).toBe('revoking')
+    // The lease runs out while the call is still registered; the release's own last transaction must see that.
+    advance(60_000)
+    rmSync(calls, { recursive: true, force: true })
+    const result = await pending
+    expect(result).toMatchObject({ state: 'needs-check', device_id: 'bench-a',
+      reason: 'the lease expired while the release waited for a call to end' })
+    expect(service.runtime().devices['bench-a']).toMatchObject({ state: 'needs-check',
+      note: 'the lease expired while the release waited for a call to end' })
+    expect(service.runtime().leases[held.lease.leaseId]).toMatchObject({ state: 'revoked' })
+  }, 10_000)
+  it('keeps the device for a person when the ticket stops qualifying while the release waits', async () => {
+    const store = openStore()
+    const { service } = rig(store, { probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    const held = grantedOf(await service.request('t1', 'a1'))
+    const calls = join(directory, 'bench', 'calls', held.lease.leaseId)
+    mkdirSync(calls, { recursive: true })
+    writeFileSync(join(calls, 'in-flight'), '')
+    const pending = service.release('t1', 'a1', { leaseId: held.lease.leaseId })
+    for (let attempt = 0; attempt < 100 && service.runtime().leases[held.lease.leaseId]?.state !== 'revoking'; attempt++) await sleep(5)
+    saveTicket(store, { ...recorded(store.tickets.get('t1')), ended: { at: clock(), by: 'executor', outcome: 'completed' } })
+    rmSync(calls, { recursive: true, force: true })
+    const result = await pending
+    expect(result).toMatchObject({ state: 'needs-check', device_id: 'bench-a',
+      reason: 'the ticket ended, waits for a person, or changed its Assignment while the release waited' })
+    expect(service.runtime().devices['bench-a']?.state).toBe('needs-check')
+    expect(service.runtime().leases[held.lease.leaseId]?.state).toBe('revoked')
+  }, 10_000)
+  it('lets a reconciliation pass revoke an expired lease a release is still waiting on, and the release keeps that result', async () => {
+    const store = openStore()
+    const { service } = rig(store, { probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    const held = grantedOf(await service.request('t1', 'a1'))
+    const calls = join(directory, 'bench', 'calls', held.lease.leaseId)
+    mkdirSync(calls, { recursive: true })
+    writeFileSync(join(calls, 'in-flight'), '')
+    const pending = service.release('t1', 'a1', { leaseId: held.lease.leaseId })
+    for (let attempt = 0; attempt < 100 && service.runtime().leases[held.lease.leaseId]?.state !== 'revoking'; attempt++) await sleep(5)
+    advance(60_000)
+    service.reconcile()
+    expect(service.runtime().leases[held.lease.leaseId]).toMatchObject({ state: 'revoked' })
+    expect(service.runtime().devices['bench-a']).toMatchObject({ state: 'needs-check', note: 'the lease expired' })
+    rmSync(calls, { recursive: true, force: true })
+    expect(await pending).toMatchObject({ state: 'not-held', device_id: 'bench-a', device_state: 'needs-check' })
+    expect(service.runtime().devices['bench-a']?.state).toBe('needs-check')
+  }, 10_000)
 })
 
 describe('explicit release and in-flight calls (B11)', () => {

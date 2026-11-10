@@ -78,8 +78,6 @@ export const benchGrantedInputId = (leaseId: string): string => key('bench-grant
  * `bench-granted` Input that hands it over, and the release, revocation and recovery that take it back.
  */
 export class BenchService {
-  /** Leases a release holds: `reconcile` leaves them alone, and their own final commit re-reads what it finds. */
-  private readonly releasing = new Set<string>()
   private pumping?: Promise<void>
   /** A pending retry of an allocation pass whose grant rolled back or whose probe failed. */
   private retry?: ReturnType<typeof setTimeout>
@@ -199,30 +197,47 @@ export class BenchService {
       held.state = 'revoking'
       this.host.engine.withdrawBench(lease.ticketId, [benchGrantedInputId(lease.id)])
     })
-    this.releasing.add(lease.id)
-    try {
-      if (!await this.callsEnded(lease.id)) {
-        this.revoke(lease.id, 'a wrapper call did not end before the release did')
-        return { state: 'needs-check', device_id: lease.deviceId, reason: 'a wrapper call did not end before the release did' }
-      }
-      const handed = this.host.store.atomic(() => {
-        const current = this.runtime(), held = current.leases[lease.id], device = current.devices[lease.deviceId]
-        // A stop, an expiry or a reconciliation may have revoked the lease meanwhile: their result stands.
-        if (!held || held.state !== 'revoking' || !device || device.state !== 'busy' || device.leaseId !== lease.id
-          || device.serial !== lease.serial) return false
-        delete current.leases[lease.id]
-        current.devices[lease.deviceId] = { state: 'idle', serial: device.serial, checkedAt: this.clock() }
-        this.write(current)
-        return true
-      })
-      if (!handed) {
-        const current = this.runtime()
-        return { state: 'not-held', device_id: lease.deviceId, device_state: current.devices[lease.deviceId]?.state }
-      }
+    if (!await this.callsEnded(lease.id)) {
+      this.revoke(lease.id, 'a wrapper call did not end before the release did')
+      return { state: 'needs-check', device_id: lease.deviceId, reason: 'a wrapper call did not end before the release did' }
+    }
+    const settled = this.settleRelease(lease)
+    if (settled.state === 'released') {
       forgetBenchCalls(this.host.stateDir, lease.id)
       void this.pump()
-      return { state: 'released', device_id: lease.deviceId, serial: lease.serial }
-    } finally { this.releasing.delete(lease.id) }
+    }
+    return settled
+  }
+  /**
+   * The last step of a release, in one transaction that re-reads the ledger: another path may have revoked the lease, or the
+   * lease may have expired, or its ticket stopped qualifying while the calls ended. Those outcomes stand; only a lease still
+   * held by this release hands its device back.
+   */
+  private settleRelease(lease: BenchLease): BenchReleaseResult {
+    let outcome: BenchReleaseResult | undefined
+    this.host.store.atomic(() => {
+      const current = this.runtime(), held = current.leases[lease.id], device = current.devices[lease.deviceId]
+      if (!held || held.state !== 'revoking' || !device || device.state !== 'busy' || device.leaseId !== lease.id
+        || device.serial !== lease.serial) {
+        outcome = { state: 'not-held', device_id: lease.deviceId, device_state: current.devices[lease.deviceId]?.state }
+        return
+      }
+      const ticket = this.host.store.tickets.get(lease.ticketId)
+      const expired = Date.parse(lease.expiresAt) <= Date.parse(this.clock())
+      if (expired || !benchEligible(ticket, lease.assignmentId)) {
+        const reason = expired ? 'the lease expired while the release waited for a call to end'
+          : 'the ticket ended, waits for a person, or changed its Assignment while the release waited'
+        this.revokeIn(current, lease.id, reason)
+        this.write(current)
+        outcome = { state: 'needs-check', device_id: lease.deviceId, reason }
+        return
+      }
+      delete current.leases[lease.id]
+      current.devices[lease.deviceId] = { state: 'idle', serial: device.serial, checkedAt: this.clock() }
+      this.write(current)
+      outcome = { state: 'released', device_id: lease.deviceId, serial: lease.serial }
+    })
+    return outcome!
   }
 
   /** Cancel a request still waiting for a device; one already granted comes back so the worker releases it by lease instead. */
@@ -280,7 +295,9 @@ export class BenchService {
     this.host.store.atomic(() => {
       const runtime = this.runtime()
       for (const lease of Object.values(runtime.leases)) {
-        if (lease.state === 'revoked' || this.releasing.has(lease.id)) continue
+        // A release in progress is held by no special rule: a lease that expired or stopped qualifying is revoked here too,
+        // and the release's own last transaction re-reads that result instead of overwriting it.
+        if (lease.state === 'revoked') continue
         const ticket = this.host.store.tickets.get(lease.ticketId)
         const reason = !benchEligible(ticket, lease.assignmentId) ? 'the ticket ended, waits for a person, or changed its Assignment'
           : Date.parse(lease.expiresAt) <= Date.parse(this.clock()) ? 'the lease expired' : undefined
