@@ -63,7 +63,9 @@ export interface BenchLease { id: string; token: string; requestId: string; tick
   /** The request this lease was granted from, kept so a revocation can put it back with its ready time and failures. */
   request?: BenchRequest
   /** The scheduling evidence at grant time. */
-  scheduling?: BenchScheduling }
+  scheduling?: BenchScheduling
+  /** When the delivery accepted the grant, as the notification chain observed it; evidence, not a device fact. */
+  acceptedAt?: string }
 /** One position in the queue's single order source; a granted or blocked request keeps its place until it is done. */
 export interface BenchOrderItem { requestId: string; phase: 'queued' | 'granted' | 'blocked' }
 /** A management action on the queue, diagnostic only: the evidence that matters is kept on the request or lease. */

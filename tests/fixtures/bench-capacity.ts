@@ -27,8 +27,8 @@ export class FakeBenchCapacity implements BenchCapacity {
     hold.consumed = true
     return true
   }
-  holdFor(ticketId: string): { id: string; consumed: boolean } | undefined {
-    for (const [id, hold] of this.holds) if (hold.ticketId === ticketId) return { id, consumed: hold.consumed }
+  holdFor(ticketId: string): { id: string; consumed: boolean; covered: boolean } | undefined {
+    for (const [id, hold] of this.holds) if (hold.ticketId === ticketId) return { id, consumed: hold.consumed, covered: false }
     return undefined
   }
   sweep(nowMs: number): { id: string; ticketId: string }[] {

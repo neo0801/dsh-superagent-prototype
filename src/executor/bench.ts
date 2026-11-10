@@ -30,6 +30,8 @@ const PROBE_TIMEOUT_MS = 5_000
 const PUMP_ROUNDS = 32
 /** A grant that rolled back or a probe that failed is tried again, a bounded number of times, without a new request. */
 const PUMP_RETRY_MS = 1_000, PUMP_RETRY_ATTEMPTS = 5
+/** A slow sweep while a request waits for capacity, which is not a failure and so is not bounded like a failure. */
+const SLOW_RETRY_MS = 30_000
 /** Failures of one request, across grants, deliveries and revocations, before it waits for a person's retry. */
 const FAILURE_LIMIT = 5
 /** Records one Ticket may hold: at the limit it gets no device until a person archives records or the Ticket ends. */
@@ -39,6 +41,8 @@ const RECORD_PAYLOAD_BYTES = 28 * 1024, RECORD_BYTES = 32 * 1024
 /** The host-only suffix (scheduling evidence, missing list, end state) is trimmed to this budget, never refused. */
 const RECORD_HOST_BYTES = 4096
 const MAX_CASES = 50
+/** The bytes one page of record summaries may serialize to. */
+const RECORD_LIST_BYTES = 8 * 1024
 /** The end state each revocation reason seals into its lease's record. */
 const END_STATE_OF: Readonly<Record<BenchRevokeReason, BenchEndState>> = { 'delivery-failed': 'revoked', expired: 'expired',
   restarted: 'restarted', cancelled: 'cancelled', 'ticket-ended': 'ticket-ended', 'assignment-changed': 'assignment-changed',
@@ -47,17 +51,21 @@ const END_STATE_OF: Readonly<Record<BenchRevokeReason, BenchEndState>> = { 'deli
 /** What a Worker may write to its open record; every identity and derived field is the host's. */
 export interface BenchRecordChange { cases?: BenchCase[]; installed?: BenchInstalled; na?: { config?: true; input?: true }
   evidence?: BenchEvidence; completedAt?: string; note?: string }
+/** Whether a text fact says something after trimming: whitespace or an empty string is no fact. */
+const filled = (value: string | undefined): boolean => (value ?? '').trim().length > 0
 /** The required facts a record lacks, in a stable order the host derives rather than the Worker states. */
 export function requiredMissingOf(record: BenchRecord): string[] {
   const missing: string[] = []
-  if (!record.installed?.artifact) missing.push('installed.artifact')
-  if (!record.installed?.config && !record.na?.config) missing.push('installed.config')
-  if (!record.installed?.input && !record.na?.input) missing.push('installed.input')
-  if (!Object.values(record.evidence ?? {}).some(list => (list?.length ?? 0) > 0)) missing.push('evidence')
+  if (!filled(record.installed?.artifact)) missing.push('installed.artifact')
+  if (!filled(record.installed?.config) && !record.na?.config) missing.push('installed.config')
+  if (!filled(record.installed?.input) && !record.na?.input) missing.push('installed.input')
+  if (!Object.values(record.evidence ?? {}).some(list => (list ?? []).some(filled))) missing.push('evidence')
   if (!record.cases.length) missing.push('cases')
+  // A completed test states when it completed; the end of a lease is not a completion time.
+  if (!filled(record.completedAt)) missing.push('completedAt')
   for (const item of record.cases) {
-    if (!item.expected) missing.push(`case:${item.id}:expected`)
-    if (!item.actual) missing.push(`case:${item.id}:actual`)
+    if (!filled(item.expected)) missing.push(`case:${item.id}:expected`)
+    if (!filled(item.actual)) missing.push(`case:${item.id}:actual`)
   }
   return missing
 }
@@ -79,18 +87,32 @@ export function verdictOf(record: BenchRecord): BenchVerdict {
 /** The host-only part of a record whose serialized size is budgeted. */
 const hostSuffixOf = (record: BenchRecord): unknown => ({ scheduling: record.scheduling ?? {}, missing: record.missing,
   endState: record.endState, endedAt: record.endedAt, verdict: record.verdict, truncated: record.truncated })
-/** Keeps the host-only fields within their budget by trimming narrative in a fixed order; the seal is still written. */
+/**
+ * Keeps the host-only fields within their budget, which is also what the sealed record can afford: the Worker's facts are
+ * capped below 32 KiB, so the suffix is trimmed to 4 KiB or to what the record can still hold, whichever is smaller. A
+ * seal is never refused for size.
+ */
 export function trimHostSuffix(record: BenchRecord): void {
   const bytes = (): number => Buffer.byteLength(JSON.stringify(hostSuffixOf(record)), 'utf8')
-  if (bytes() <= RECORD_HOST_BYTES) return
+  // The record's size without the host fields that are budgeted: the Worker's facts plus the small derived verdict.
+  const withoutSuffix = (): number => {
+    const copy: Partial<BenchRecord> = { ...record }
+    delete copy.scheduling
+    delete copy.missing
+    delete copy.endState
+    delete copy.endedAt
+    return Buffer.byteLength(JSON.stringify(copy), 'utf8')
+  }
+  const budget = Math.max(128, Math.min(RECORD_HOST_BYTES, RECORD_BYTES - withoutSuffix() - 64))
+  if (bytes() <= budget) return
   record.truncated = true
   if (record.scheduling?.reason) record.scheduling.reason = record.scheduling.reason.slice(0, 200)
   if (record.scheduling?.reorder) record.scheduling.reorder.reason = record.scheduling.reorder.reason.slice(0, 200)
   record.missing = record.missing.slice(0, 20).map(item => item.slice(0, 100))
-  if (bytes() <= RECORD_HOST_BYTES) return
+  if (bytes() <= budget) return
   if (record.scheduling) delete record.scheduling.reason
-  while (bytes() > RECORD_HOST_BYTES && record.missing.length) record.missing.pop()
-  if (bytes() > RECORD_HOST_BYTES && record.scheduling) delete record.scheduling.reorder
+  while (bytes() > budget && record.missing.length) record.missing.pop()
+  if (bytes() > budget && record.scheduling) delete record.scheduling.reorder
 }
 /** The bytes one record serializes to. */
 export const recordBytes = (record: BenchRecord): number => Buffer.byteLength(JSON.stringify(record), 'utf8')
@@ -113,7 +135,7 @@ export interface BenchCapacity {
   hold(ticketId: string, ttlMs: number, nowMs: number): { id: string; covered: boolean } | undefined
   releaseHold(id: string): void
   consumeHold(id: string): boolean
-  holdFor(ticketId: string): { id: string; consumed: boolean } | undefined
+  holdFor(ticketId: string): { id: string; consumed: boolean; covered: boolean } | undefined
   /** Releases reservations whose deadline passed, returning them so their grants can be revoked. */
   sweep(nowMs: number): { id: string; ticketId: string }[]
   /** Reservations still pending, for scheduling the sweep. */
@@ -151,7 +173,7 @@ export interface BenchHost {
 export interface BenchGrantInfo { leaseId: string; token: string; deviceId: string; serial: string; expiresAt: string; command: string }
 export type BenchRequestResult = { state: 'granted'; lease: BenchGrantInfo; request_id: string }
   | { state: 'queued'; request_id: string; devices: string }
-  | { state: 'unavailable'; reason: string }
+  | { state: 'unavailable'; reason: string; request_id?: string }
 export type BenchReleaseResult = { state: 'released'; device_id: string; serial: string }
   | { state: 'busy'; waiting: string[] }
   | { state: 'needs-check'; device_id: string; reason: string }
@@ -164,7 +186,9 @@ export interface BenchDeviceView { id: string; serial: string; state: DeviceStat
 export interface BenchQueueView { request_id: string; ticket_id: string; device_id?: string; level: BenchLevel; effective_level: BenchLevel
   promoted: boolean; batch_id: string; batch_label?: string; version: BenchVersion; ready_at: string; waited_seconds: number
   /** The waiting position among requests that are neither granted nor blocked; 1 is the front. */
-  position: number; attempts: number; urgent_hint?: string
+  position?: number; attempts: number; urgent_hint?: string
+  /** The reason the host stopped trying, when this request is blocked and so holds no waiting position. */
+  blocked?: string
   /** Why the host cannot grant it now although it is still valid, such as the ticket waiting for a person. */
   problem?: string }
 export interface BenchView { devices: BenchDeviceView[]; queue: BenchQueueView[]
@@ -194,6 +218,8 @@ export interface BenchRecord { recordId: string; ticketId: string; assignmentId:
   started: 'reported' | 'unknown'
   /** The time the wrapper reported, not the time the host read it; `observedAt` is the host's reading time. */
   startedAt?: string
+  /** When the delivery accepted the grant, which the notification chain keeps even when no wrapper call ran. */
+  acceptedAt?: string
   observedAt: string
   cases: BenchCase[]
   installed?: BenchInstalled
@@ -264,8 +290,14 @@ export class BenchService {
     const runtime = stored as BenchRuntime
     if (version === 1) {
       const sorted = [...runtime.queue].sort((a, b) => a.readyAt.localeCompare(b.readyAt) || a.id.localeCompare(b.id))
+      // The batch counter resumes after every batch a migrated request already names, so a retest cannot reuse one.
+      const batchCount: Record<string, number> = {}
+      for (const item of sorted) {
+        const named = Number(item.batchId?.split('-').at(-1))
+        if (Number.isFinite(named)) batchCount[item.ticketId] = Math.max(batchCount[item.ticketId] ?? 0, named)
+      }
       Object.assign(runtime, { version: 2, order: sorted.map(item => ({ requestId: item.id,
-        phase: item.blocked ? 'blocked' as const : 'queued' as const })), audit: [], batchCount: {}, revision: 0 })
+        phase: item.blocked ? 'blocked' as const : 'queued' as const })), audit: [], batchCount, revision: 0 })
     }
     runtime.revision ??= 0
     runtime.audit ??= []
@@ -287,6 +319,18 @@ export class BenchService {
   private nowMs(): number { return Date.parse(this.clock()) }
   private holdMs(): number { return (this.host.config.holdSeconds ?? HOLD_SECONDS) * 1000 }
   private capacity(): BenchCapacity { return this.host.capacity() }
+  /**
+   * Gives a grant's capacity reservation back only while no delivery has taken it over: a taken-over reservation belongs to
+   * the delivery that is starting the Worker, which frees it when that delivery ends.
+   */
+  private releaseUnclaimedHold(lease: BenchLease): void {
+    if (!lease.holdId) return
+    try {
+      const held = this.capacity().holdFor(lease.ticketId)
+      if (held?.id === lease.holdId && held.consumed) return
+      this.capacity().releaseHold(lease.holdId)
+    } catch { /* No capacity host yet. */ }
+  }
   /** Records a change that may make another request servable, so a grant selected before it is re-evaluated. */
   private bump(runtime: BenchRuntime): void { runtime.revision = (runtime.revision ?? 0) + 1 }
   private mutate<T>(work: (runtime: BenchRuntime) => T): T {
@@ -439,26 +483,30 @@ export class BenchService {
     void this.pump()
   }
 
-  /** The devices and the waiting requests, with each request's evidence and place in the queue. */
+  /** The devices and the requests: waiting ones with their place, and blocked ones without one, so a person can act on both. */
   view(): BenchView {
     const runtime = this.runtime()
     const waiting = this.waitingOf(runtime)
-    return { devices: this.host.config.devices.map(device => {
-      const record = runtime.devices[device.id], lease = record?.leaseId ? runtime.leases[record.leaseId] : undefined
-      return { id: device.id, serial: device.serial, state: record?.state ?? 'idle', capabilities: [...device.capabilities],
-        actions: [...device.actions], ...device.maintainer ? { maintainer: device.maintainer } : {},
-        ...lease ? { lease_id: lease.id, ticket_id: lease.ticketId, expires_at: lease.expiresAt } : {},
-        ...record?.note ? { note: record.note } : {} }
-    }), queue: waiting.map((item, index) => {
+    const blocked = runtime.queue.filter(item => item.blocked).sort((a, b) => this.orderIndex(runtime, a.id) - this.orderIndex(runtime, b.id))
+    const entry = (item: BenchRequest, index?: number): BenchQueueView => {
       // A stored problem (such as a full record quota) outranks the one derived from the ticket.
       const problem = item.problem ?? this.problemOf(item)
       const effective = this.effectiveLevel(item)
       return { request_id: item.id, ticket_id: item.ticketId, ...item.deviceId ? { device_id: item.deviceId } : {},
         level: item.level, effective_level: effective, promoted: effective === 'urgent' && item.level !== 'urgent',
         batch_id: item.batchId, ...item.batchLabel ? { batch_label: item.batchLabel } : {}, version: item.version,
-        ready_at: item.readyAt, waited_seconds: this.waitedSeconds(item), position: index + 1, attempts: item.attempts,
-        ...item.urgentHint ? { urgent_hint: item.urgentHint } : {}, ...problem ? { problem } : {} }
-    }), queue_version: runtime.revision }
+        ready_at: item.readyAt, waited_seconds: this.waitedSeconds(item), attempts: item.attempts,
+        ...index === undefined ? {} : { position: index + 1 }, ...item.blocked ? { blocked: item.blocked.reason } : {},
+        ...problem ? { problem } : {}, ...item.urgentHint ? { urgent_hint: item.urgentHint } : {} }
+    }
+    return { devices: this.host.config.devices.map(device => {
+      const record = runtime.devices[device.id], lease = record?.leaseId ? runtime.leases[record.leaseId] : undefined
+      return { id: device.id, serial: device.serial, state: record?.state ?? 'idle', capabilities: [...device.capabilities],
+        actions: [...device.actions], ...device.maintainer ? { maintainer: device.maintainer } : {},
+        ...lease ? { lease_id: lease.id, ticket_id: lease.ticketId, expires_at: lease.expiresAt } : {},
+        ...record?.note ? { note: record.note } : {} }
+    }), queue: [...waiting.map((item, index) => entry(item, index)), ...blocked.map(item => entry(item))],
+      queue_version: runtime.revision }
   }
   /** Why a still-valid request cannot be granted now, derived from the ticket rather than stored. */
   private problemOf(request: BenchRequest): string | undefined {
@@ -483,9 +531,22 @@ export class BenchService {
     if (held) return { state: 'granted', lease: this.grantInfo(held), request_id: requestId }
     const queued = this.runtime().queue.find(item => item.id === requestId)
     if (queued?.blocked) {
-      return { state: 'unavailable', reason: 'the request is blocked for a person; retry or cancel it from the bench panel' }
+      return { state: 'unavailable', reason: 'the request is blocked for a person; retry or cancel it from the bench panel',
+        request_id: requestId }
     }
-    if (queued?.problem) return { state: 'unavailable', reason: queued.problem }
+    if (queued?.problem) {
+      // A temporary problem (a person's wait, a failed delivery) may be gone; only the record quota is permanent here.
+      if (queued.problem === 'record-quota' || !benchEligible(ticket, assignmentId)) {
+        return { state: 'unavailable', request_id: requestId, reason: queued.problem === 'record-quota'
+          ? 'this ticket reached its bench record quota (200); archive records or end the ticket before another attempt'
+          : queued.problem }
+      }
+      this.mutate(runtime => {
+        const current = runtime.queue.find(item => item.id === requestId)
+        if (current) delete current.problem
+        this.bump(runtime)
+      })
+    }
     const batchLabel = want.batchLabel?.trim() || undefined
     if (queued && queued.batchLabel !== batchLabel) {
       throw new Error('this ticket already waits in a batch with another label; cancel that request or repeat its label')
@@ -510,8 +571,11 @@ export class BenchService {
     const lease = this.held(requestId)
     if (lease) return { state: 'granted', lease: this.grantInfo(lease), request_id: requestId }
     const waiting = this.runtime().queue.find(item => item.id === requestId)
+    if (waiting?.blocked) {
+      return { state: 'unavailable', request_id: requestId, reason: 'the request is blocked for a person; retry or cancel it from the bench panel' }
+    }
     if (waiting?.problem) {
-      return { state: 'unavailable', reason: waiting.problem === 'record-quota'
+      return { state: 'unavailable', request_id: requestId, reason: waiting.problem === 'record-quota'
         ? 'this ticket reached its bench record quota (200); archive records or end the ticket before another attempt'
         : waiting.problem }
     }
@@ -651,7 +715,7 @@ export class BenchService {
       }
       delete current.leases[lease.id]
       current.devices[lease.deviceId] = { state: 'idle', serial: device.serial, checkedAt: this.clock() }
-      if (lease.holdId) { try { this.capacity().releaseHold(lease.holdId) } catch { /* No capacity host yet. */ } }
+      this.releaseUnclaimedHold(lease)
       // A released request is done, so its place in the queue goes with it; a retest asks again as a new batch.
       this.dropOrder(current, lease.requestId)
       // Sealing happens with the release itself, so no lease disappears leaving an open record behind.
@@ -713,6 +777,28 @@ export class BenchService {
     this.scheduleHoldSweep()
     void this.pump()
   }
+  /**
+   * The grant's Input crossed the enqueue point, so the hand-off completed: the request's failure budget clears and the
+   * lease and its open record keep the acceptance time. That time is what the notification chain observed, never a device
+   * fact; it is recorded as evidence for the notification path, not as proof that the device ran anything.
+   */
+  delivered(leaseId: string, acceptedAt?: string): void {
+    this.mutate(runtime => {
+      const lease = runtime.leases[leaseId]
+      if (!lease) return
+      const at = acceptedAt ?? this.clock()
+      lease.acceptedAt ??= at
+      if (lease.request) { lease.request.attempts = 0; delete lease.request.blocked; delete lease.request.problem }
+      const queued = runtime.queue.find(item => item.id === lease.requestId)
+      if (queued) { queued.attempts = 0; delete queued.blocked; delete queued.problem }
+      const record = this.host.store.get(KV.bench.records(lease.ticketId, lease.id))
+      if (record && record.state === 'open') {
+        this.host.store.set(KV.bench.records(lease.ticketId, lease.id), { ...record, acceptedAt: record.acceptedAt ?? at,
+          ...record.started === 'unknown' ? { observedAt: this.clock() } : {} })
+      }
+      this.bump(runtime)
+    })
+  }
   private revoke(leaseId: string, reason: BenchRevokeReason, detail: string): void {
     this.host.store.atomic(() => {
       const runtime = this.runtime()
@@ -743,7 +829,8 @@ export class BenchService {
     this.closeRequest(runtime, lease, reason, detail)
     // A revoked lease seals its record in the same transaction, with the reason the device went to a person.
     this.sealRecord(lease, END_STATE_OF[reason])
-    if (lease.holdId) { try { this.capacity().releaseHold(lease.holdId) } catch { /* No capacity host yet. */ } }
+    this.audit(runtime, { at: this.clock(), action: 'revoke', requestId: lease.requestId, reason: detail ?? REVOKE_TEXT[reason] })
+    this.releaseUnclaimedHold(lease)
     this.bump(runtime)
     return true
   }
@@ -791,6 +878,8 @@ export class BenchService {
       if (this.prune(runtime)) changed = true
       // A request that waited past the promotion threshold is served as urgent from here on, and the fact is recorded once.
       if (this.refreshPromotions(runtime)) changed = true
+      // A temporary obstacle may have cleared while no scheduling event happened; a periodic pass must still wake the queue.
+      if (this.refreshProblems(runtime)) changed = true
       if (changed) this.write(runtime)
     })
     if (changed) void this.pump()
@@ -800,8 +889,8 @@ export class BenchService {
    * A person clears a blocked request's failure budget: it waits again with the same ready time, batch and selection state,
    * and the host stops trying until someone calls this.
    */
-  retry(requestId: string, operator?: string): boolean {
-    if (operator !== undefined) this.operatorOf(operator)
+  retry(requestId: string, operator: string): boolean {
+    const name = this.operatorOf(operator)
     const retried = this.mutate(runtime => {
       const request = runtime.queue.find(item => item.id === requestId)
       if (!request?.blocked) return false
@@ -809,6 +898,7 @@ export class BenchService {
       request.attempts = 0
       delete request.problem
       this.setPhase(runtime, request.id, 'queued')
+      this.audit(runtime, { at: this.clock(), action: 'retry', requestId, operator: name, reason: 'a person cleared the failure budget' })
       this.bump(runtime)
       return true
     })
@@ -828,13 +918,17 @@ export class BenchService {
       .flatMap(name => { const found = this.host.store.get(name as ReturnType<typeof KV.bench.records>); return found ? [found] : [] })
   }
   /**
-   * Append a Worker's facts to the open record of its active lease. The Worker supplies facts only: the host fills the
-   * identities, the times and the derived verdict, refuses writes after a seal, and refuses a payload or record over budget.
+   * Append a Worker's facts to the open record of one specific lease. The Worker names the attempt it is writing about, so a
+   * stale Worker cannot pour an old attempt's facts into a newer lease's record; the host verifies the ticket, Assignment
+   * and lease, fills every identity and time, refuses writes after a seal, and keeps the facts under 28 KiB.
    */
-  record(ticketId: string, assignmentId: string, change: BenchRecordChange): BenchRecord {
-    const lease = Object.values(this.runtime().leases).find(item => item.ticketId === ticketId && item.assignmentId === assignmentId
-      && item.state === 'active')
-    if (!lease) throw new Error('This ticket holds no active bench lease to record against')
+  record(ticketId: string, assignmentId: string, leaseId: string, change: BenchRecordChange): BenchRecord {
+    if (!filled(leaseId)) throw new Error('name the lease this record is about')
+    const lease = this.runtime().leases[leaseId]
+    if (!lease || lease.ticketId !== ticketId || lease.assignmentId !== assignmentId) {
+      throw new Error('This attempt is not an active bench lease of this ticket and Assignment')
+    }
+    if (lease.state !== 'active') throw new Error('This lease is not active; its record can no longer be written')
     if (Date.parse(lease.expiresAt) <= this.nowMs()) throw new Error('The lease expired; its record can no longer be written')
     const payloadBytes = Buffer.byteLength(JSON.stringify(change), 'utf8')
     if (payloadBytes > RECORD_PAYLOAD_BYTES) throw new Error('the record payload is too large; keep one write under 28 KiB')
@@ -842,34 +936,54 @@ export class BenchService {
       if (item.outcome !== 'passed' && item.outcome !== 'failed' && item.outcome !== 'insufficient-evidence') {
         throw new Error('a case outcome is passed, failed or insufficient-evidence')
       }
-      if (!item.id.trim() || !item.expected.trim() || !item.actual.trim()) {
+      if (!filled(item.id) || !filled(item.expected) || !filled(item.actual)) {
         throw new Error('a case needs an id, what it expected and what it saw')
       }
     }
     const record = this.host.store.get(KV.bench.records(ticketId, lease.id))
     if (!record) throw new Error('This lease has no test record')
     if (record.state !== 'open') throw new Error('The record of this lease is sealed; a later attempt is a new record')
-    const cases: BenchCase[] = (change.cases ?? []).map(item => ({ id: item.id, expected: item.expected, actual: item.actual,
-      outcome: item.outcome, ...item.note ? { note: item.note } : {} }))
+    const cases: BenchCase[] = (change.cases ?? []).map(item => ({ id: item.id.trim(), expected: item.expected.trim(),
+      actual: item.actual.trim(), outcome: item.outcome, ...item.note ? { note: item.note } : {} }))
     if (record.cases.length + cases.length > MAX_CASES) throw new Error(`a record holds at most ${MAX_CASES} cases`)
     const updated: BenchRecord = { ...record, cases: [...record.cases, ...cases],
       ...change.installed ? { installed: { ...record.installed, ...change.installed } } : {},
       ...change.na ? { na: { ...record.na, ...change.na } } : {}, evidence: mergeEvidence(record.evidence, change.evidence),
-      ...change.completedAt ? { completedAt: change.completedAt } : {}, ...change.note ? { note: change.note } : {} }
+      ...filled(change.completedAt) ? { completedAt: change.completedAt!.trim() } : {}, ...change.note ? { note: change.note } : {} }
     const started = this.observationOf(lease.id)
-    if (started && updated.started === 'unknown') { updated.started = 'reported'; updated.startedAt = started }
+    if (started && updated.started === 'unknown') {
+      updated.started = 'reported'
+      updated.startedAt = started
+      // The host has only now read the report, so this is its observation time, not the grant time.
+      updated.observedAt = this.clock()
+    }
     updated.missing = requiredMissingOf(updated)
     updated.verdict = verdictOf(updated)
-    if (recordBytes(updated) > RECORD_BYTES) throw new Error('the record would exceed 32 KiB; archive it and start a new batch')
+    // The Worker's facts are capped at 28 KiB so a seal always fits the 32 KiB record with its host suffix.
+    if (recordBytes(updated) > RECORD_BYTES - RECORD_HOST_BYTES) {
+      throw new Error('the record reached 28 KiB of facts; archive it and start a new batch for further cases')
+    }
     this.host.store.set(KV.bench.records(ticketId, lease.id), updated)
     return updated
   }
-  /** A ticket's records, newest first, paged by `offset`; each entry is a summary, the full record its own entry. */
+  /**
+   * A ticket's records, newest first, paged by `offset`. A page is cut when its summaries would pass 8 KiB, and always
+   * carries at least one entry, so one huge summary cannot make the page unreadable.
+   */
   listRecords(ticketId: string, offset: number, limit = 20): { items: ReturnType<typeof recordSummary>[]; next_offset: number | null } {
     const records = this.recordsOf(ticketId).sort((a, b) => (b.endedAt ?? b.grantedAt).localeCompare(a.endedAt ?? a.grantedAt))
     const size = Math.min(limit, 50)
-    return { items: records.slice(offset, offset + size).map(recordSummary),
-      next_offset: records.length > offset + size ? offset + size : null }
+    const items: ReturnType<typeof recordSummary>[] = []
+    let bytes = 2
+    for (const record of records.slice(offset, offset + size)) {
+      const summary = recordSummary(record)
+      const next = Buffer.byteLength(JSON.stringify(summary), 'utf8')
+      if (items.length && bytes + next > RECORD_LIST_BYTES) break
+      items.push(summary)
+      bytes += next + 1
+    }
+    const consumed = offset + items.length
+    return { items, next_offset: records.length > consumed ? consumed : null }
   }
   /** One record of a ticket; `recordId` is the record's own name, whose last segment is its lease. */
   readRecord(ticketId: string, recordId: string): BenchRecord | undefined {
@@ -905,7 +1019,12 @@ export class BenchService {
     record.endState = endState
     record.endedAt = this.clock()
     const started = this.observationOf(lease.id)
-    if (started && record.started === 'unknown') { record.started = 'reported'; record.startedAt = started }
+    if (started && record.started === 'unknown') {
+      record.started = 'reported'
+      record.startedAt = started
+      // The time the host first read the report, not the grant time and not the wrapper's own clock.
+      record.observedAt = this.clock()
+    }
     record.missing = requiredMissingOf(record)
     record.verdict = verdictOf(record)
     trimHostSuffix(record)
@@ -964,9 +1083,10 @@ export class BenchService {
       const candidates = this.candidates(runtime, skip)
       if (!candidates.length) return
       let progress = false
+      const probed = new Set<string>()
       for (const request of candidates) {
         if (this.host.lifetime.aborted) return
-        const device = await this.choose(this.runtime(), request, skip)
+        const device = await this.choose(this.runtime(), request, skip, probed)
         if (!device) continue
         // A grant to a worker that is not running takes capacity before it takes the device, so a device is never held for a
         // worker the host has no slot to start.
@@ -981,7 +1101,16 @@ export class BenchService {
         this.markFailure(request.id, 'the grant rolled back or the device kept failing')
         skip.add(device.id)
       }
-      if (!progress) return
+      if (!progress) {
+        // A request whose every compatible device failed its probe in this pass is a failed attempt, counted once per pass.
+        for (const request of candidates) {
+          const devices = this.compatible(request.capabilities, request.deviceId)
+          if (devices.length && devices.every(device => probed.has(device.id))) {
+            this.markFailure(request.id, 'no compatible device answered its probe')
+          }
+        }
+        return
+      }
     }
   }
   /** Drops requests whose ticket ended or changed its Assignment; a request waiting for a person stays with its problem. */
@@ -1023,6 +1152,7 @@ export class BenchService {
       if (request.attempts >= FAILURE_LIMIT) {
         request.blocked = { reason, at: this.clock(), attempts: request.attempts }
         this.setPhase(runtime, request.id, 'blocked')
+        this.audit(runtime, { at: request.blocked.at, action: 'block', requestId: request.id, reason })
       }
       this.bump(runtime)
     })
@@ -1077,11 +1207,15 @@ export class BenchService {
     // A pass can end after the host closed its Store, which has nothing left to grant.
     let waiting: boolean
     try { waiting = !this.host.lifetime.aborted && this.needsRetry() } catch { return }
-    if (!waiting || this.attempts >= PUMP_RETRY_ATTEMPTS) { this.attempts = 0; return }
-    this.attempts++
+    if (!waiting) { this.attempts = 0; return }
+    // Capacity waits are not failures: the fast retries are bounded, then a slow sweep keeps noticing a freed slot even
+    // when no other event reaches the bench service.
+    const fast = this.attempts < PUMP_RETRY_ATTEMPTS
+    if (fast) this.attempts++
     // One timer at a time: a pass that ends while another retry waits must not leave two chains running.
     this.cancelRetry()
-    this.retryTimer = setTimeout(() => { this.retryTimer = undefined; void this.kick() }, this.host.retryMs ?? PUMP_RETRY_MS)
+    this.retryTimer = setTimeout(() => { this.retryTimer = undefined; void this.kick() },
+      fast ? this.host.retryMs ?? PUMP_RETRY_MS : SLOW_RETRY_MS)
     this.retryTimer.unref?.()
   }
   private cancelRetry(): void {
@@ -1089,13 +1223,14 @@ export class BenchService {
     clearTimeout(this.retryTimer); this.retryTimer = undefined
   }
   /** The first idle device the request may use whose probe reports `device`; a device that does not goes offline for a person. */
-  private async choose(runtime: BenchRuntime, request: BenchRequest, skip: Set<string>): Promise<BenchDevice | undefined> {
+  private async choose(runtime: BenchRuntime, request: BenchRequest, skip: Set<string>, probed?: Set<string>): Promise<BenchDevice | undefined> {
     for (const device of this.compatible(request.capabilities, request.deviceId)) {
       const record = runtime.devices[device.id]
       if (!record || record.state !== 'idle' || record.serial !== device.serial || skip.has(device.id)) continue
       if (await this.probe(device.serial) === 'device') return device
       this.markOffline(device.id, device.serial)
       skip.add(device.id)
+      probed?.add(device.id)
     }
     return undefined
   }

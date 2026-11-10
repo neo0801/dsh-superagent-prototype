@@ -76,6 +76,7 @@ export function benchTools(host: BenchToolsHost, ticket: Ticket): Tool[] {
         + 'identities, seals the record when the device is released and derives the verdict from these facts; a later attempt is a '
         + 'new record. Write only what you observed: the host never verifies the evidence itself.',
       schema: z.object({
+        lease_id: z.string().min(1).describe('The lease this attempt runs under, as the grant named it; a stale attempt cannot write into a newer lease.'),
         cases: z.array(z.object({ id: z.string().min(1).max(100), expected: z.string().min(1).max(2000),
           actual: z.string().min(1).max(2000), outcome: z.enum(['passed', 'failed', 'insufficient-evidence']),
           note: z.string().max(1000).optional() }).strict()).max(50).optional().describe('What this attempt ran, expected and saw.'),
@@ -93,7 +94,7 @@ export function benchTools(host: BenchToolsHost, ticket: Ticket): Tool[] {
         const change = { ...args.cases ? { cases: args.cases } : {}, ...args.installed ? { installed: args.installed } : {},
           ...args.na ? { na: args.na } : {}, ...args.evidence ? { evidence: args.evidence } : {},
           ...args.completed_at ? { completedAt: args.completed_at } : {}, ...args.note ? { note: args.note } : {} }
-        const record = host.bench.record(ticketId, assignment(), change)
+        const record = host.bench.record(ticketId, assignment(), args.lease_id, change)
         return { record_id: record.recordId, state: record.state, cases: record.cases.length, verdict: record.verdict,
           missing: record.missing }
       },

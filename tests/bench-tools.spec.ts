@@ -226,7 +226,7 @@ describe('DshExecutor delivery of a bench grant (B23)', () => {
     store.tickets.save(base)
     const input = grant('assignment-1')
     engine.benchGranted(base.id, input)
-    const bench = { grantValid: vi.fn(() => options.valid()), revokeForTicket: vi.fn() }
+    const bench = { grantValid: vi.fn(() => options.valid()), revokeForTicket: vi.fn(), delivered: vi.fn(), pump: vi.fn(async () => {}) }
     const prompt = vi.fn(options.prompt ?? (async () => {}))
     const sessions = { ensure: vi.fn(async () => ({})), prompt, relay: vi.fn(), holds: vi.fn(async () => false), promptedId: vi.fn((id: string) => id) }
     const context = { agents: new Map(), subprocess: { spawn: vi.fn() }, get: () => undefined }
@@ -310,7 +310,7 @@ describe('DshExecutor.stop', () => {
         outbox: { send: () => {}, status: () => undefined, withdraw: () => {} }, now: () => AT })
       const base = ticket([assignment('assignment-1')])
       store.tickets.save(base)
-      const bench = { grantValid: vi.fn(() => true), revokeForTicket: vi.fn() }
+      const bench = { grantValid: vi.fn(() => true), revokeForTicket: vi.fn(), delivered: vi.fn(), pump: vi.fn(async () => {}) }
       const host = {
         context: { agents: new Map(), subprocess: { spawn: vi.fn() }, get: () => undefined }, engine, store,
         effects: { handle: vi.fn(), enqueue: vi.fn() },

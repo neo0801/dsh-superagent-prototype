@@ -231,7 +231,7 @@ function routes(runtime: HttpHost): Routes {
         queueVersion: move.queue_version, reason: move.reason })
     },
     'POST bench/queue/:id/retry': async ({ params, body }) => {
-      const retry = z.object({ operator: z.string().min(1).max(120).optional() }).strict().parse((await body()) ?? {})
+      const retry = z.object({ operator: z.string().min(1).max(120) }).strict().parse((await body()) ?? {})
       return { retried: runtime.bench?.retry(decoded(params.id), retry.operator) ?? false }
     },
     // The test records a Ticket's bench attempts left behind: summaries with a cursor, and one full record by its id.

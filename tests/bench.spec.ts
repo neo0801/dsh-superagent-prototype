@@ -405,7 +405,7 @@ describe('queued cancellation and release inputs (B16)', () => {
     const store = openStore()
     const { service } = rig(store, { probe: async () => 'device' })
     saveTicket(store, ticket('t1', [assignment('a1')]))
-    grantedOf(await service.request('t1', 'a1'))
+    const held = grantedOf(await service.request('t1', 'a1'))
     const result = await service.release('t1', 'a1', { requestId: key('bench-request', 't1', 'a1') })
     expect(result).toEqual({ state: 'not-held', device_id: 'bench-a', device_state: 'busy' })
     expect(service.runtime().devices['bench-a']?.state).toBe('busy')
@@ -811,7 +811,7 @@ describe('clear and view', () => {
     const store = openStore()
     const { service } = rig(store, { devices: [device('bench-a', 'SERIAL-A'), device('bench-b', 'SERIAL-B')], probe: async () => 'device' })
     saveTicket(store, ticket('t1', [assignment('a1')]))
-    grantedOf(await service.request('t1', 'a1'))
+    const held = grantedOf(await service.request('t1', 'a1'))
     expect(service.clear('bench-a')).toBe(false)
     expect(service.clear('bench-b')).toBe(false)
     expect(service.clear('bench-unknown')).toBe(false)
@@ -840,7 +840,7 @@ describe('clear and view', () => {
     expect(onC.lease.leaseId).not.toBe(onB.lease.leaseId)
     expect(view.queue).toEqual([{ request_id: key('bench-request', 't1', 't1-assignment'), ticket_id: 't1', level: 'normal',
       effective_level: 'normal', promoted: false, batch_id: 'b-t1-1', version: {}, ready_at: clock(), waited_seconds: 0,
-      position: 1, attempts: 0 }])
+      position: 1, attempts: 1 }])
   })
 })
 
@@ -952,7 +952,7 @@ describe('capacity reservations (S1)', () => {
     expect(blocked).toMatchObject({ attempts: 5 })
     expect(blocked?.blocked).toMatchObject({ attempts: 5 })
     expect(await service.request('t1', 'a1')).toMatchObject({ state: 'unavailable' })
-    expect(service.retry(queuedRequestId('t1', 'a1'))).toBe(true)
+    expect(service.retry(queuedRequestId('t1', 'a1'), 'zhang')).toBe(true)
     expect(service.runtime().queue[0]?.attempts).toBe(0)
     expect(grantedOf(await service.request('t1', 'a1')).lease.deviceId).toBe('bench-a')
   })
@@ -1156,7 +1156,9 @@ describe('queue order, levels and reordering (S2)', () => {
       service.deliveryFailed(held.lease.leaseId, 'the grant could not be delivered')
       service.clear('bench-a')
     }
-    expect(queue(service)).toEqual([])
+    expect(queue(service)).toHaveLength(1)
+    expect(queue(service)[0]).toMatchObject({ ticket_id: 't1', blocked: 'the grant could not be delivered', attempts: 5 })
+    expect(queue(service)[0]?.position).toBeUndefined()
     expect(service.runtime().order).toEqual([{ requestId: requestId('t1', 'a1'), phase: 'blocked' }])
     expect(service.retry(requestId('t1', 'a1'), 'zhang')).toBe(true)
     expect(queue(service).map(item => item.ticket_id)).toEqual(['t1'])
@@ -1257,7 +1259,7 @@ describe('traceable test records (S3)', () => {
     const { service } = rig(store, { probe: async () => 'device' })
     saveTicket(store, ticket('t1', [assignment('a1')]))
     const held = grantedOf(await service.request('t1', 'a1'))
-    service.record('t1', 'a1', { cases: [{ id: 'c1', expected: 'ok', actual: 'ok', outcome: 'passed' }],
+    service.record('t1', 'a1', held.lease.leaseId, { cases: [{ id: 'c1', expected: 'ok', actual: 'ok', outcome: 'passed' }],
       installed: { artifact: 'app.apk', config: 'cfg-1', input: 'input-1' }, evidence: { logs: ['bench/l1.txt'] },
       completedAt: clock() })
     service.deliveryFailed(held.lease.leaseId, 'the device went offline')
@@ -1269,16 +1271,16 @@ describe('traceable test records (S3)', () => {
     saveTicket(store, ticket('t1', [assignment('a1')]))
     const held = grantedOf(await service.request('t1', 'a1'))
     // The host, not the Worker, fills the identities: a write against another Assignment is refused.
-    expect(() => service.record('t1', 'other-assignment', { cases: [] })).toThrow(/no active bench lease/)
+    expect(() => service.record('t1', 'other-assignment', held.lease.leaseId, { cases: [] })).toThrow(/not an active bench lease/)
     // A sealed record cannot be appended, even by the lease's own Worker.
     const record = openRecord(service, held.lease.leaseId)
     store.set(KV.bench.records('t1', held.lease.leaseId), { ...record, state: 'sealed' })
-    expect(() => service.record('t1', 'a1', { cases: [{ id: 'c1', expected: 'ok', actual: 'ok', outcome: 'passed' }] }))
+    expect(() => service.record('t1', 'a1', held.lease.leaseId, { cases: [{ id: 'c1', expected: 'ok', actual: 'ok', outcome: 'passed' }] }))
       .toThrow(/sealed/)
     // After a release the lease is gone, so there is nothing to record against.
     store.set(KV.bench.records('t1', held.lease.leaseId), record)
     releasedOf(await service.release('t1', 'a1', { leaseId: held.lease.leaseId }))
-    expect(() => service.record('t1', 'a1', { cases: [] })).toThrow(/no active bench lease/)
+    expect(() => service.record('t1', 'a1', held.lease.leaseId, { cases: [] })).toThrow(/not an active bench lease/)
   })
   it('derives the verdict from facts in one place', () => {
     expect(verdictOf(complete('t1', 'l1', { state: 'open', verdict: 'open' }))).toBe('open')
@@ -1309,11 +1311,11 @@ describe('traceable test records (S3)', () => {
     const store = openStore()
     const { service } = rig(store, { probe: async () => 'device' })
     saveTicket(store, ticket('t1', [assignment('a1')]))
-    grantedOf(await service.request('t1', 'a1'))
-    expect(() => service.record('t1', 'a1', { cases: [{ id: 'c1', expected: 'a', actual: 'b'.repeat(29 * 1024),
+    const held = grantedOf(await service.request('t1', 'a1'))
+    expect(() => service.record('t1', 'a1', held.lease.leaseId, { cases: [{ id: 'c1', expected: 'a', actual: 'b'.repeat(29 * 1024),
       outcome: 'passed' }] })).toThrow(/too large/)
     const cases = Array.from({ length: 51 }, (_, index) => ({ id: `c${index}`, expected: 'a', actual: 'b', outcome: 'passed' as const }))
-    expect(() => service.record('t1', 'a1', { cases })).toThrow(/at most 50 cases/)
+    expect(() => service.record('t1', 'a1', held.lease.leaseId, { cases })).toThrow(/at most 50 cases/)
   })
   it('lists summaries with a cursor and reads one record by its id', async () => {
     const store = openStore()
@@ -1333,5 +1335,133 @@ describe('traceable test records (S3)', () => {
     expect(service.readRecord('t1', recordId)).toMatchObject({ ticketId: 't1', state: 'sealed' })
     // The ticket is part of the lookup, so another ticket never reads this record.
     expect(service.readRecord('t2', recordId)).toBeUndefined()
+  })
+})
+
+describe('review regressions (F01-F11)', () => {
+  const requestId = (ticket: string, assignment: string): string => key('bench-request', ticket, assignment)
+  const seed = (store: Store, ticketId: string, leaseId: string, overrides: Partial<BenchRecord> = {}): void => {
+    store.set(KV.bench.records(ticketId, leaseId), { recordId: key('bench-record', ticketId, leaseId), ticketId, assignmentId: 'a1',
+      leaseId, deviceId: 'bench-a', serial: 'SERIAL-A', batchId: 'b', version: {}, grantedAt: AT, state: 'open', started: 'unknown',
+      observedAt: AT, cases: [], evidence: {}, missing: [], truncated: false, verdict: 'open', ...overrides } satisfies BenchRecord)
+  }
+  it('keeps a taken-over reservation when the lease is revoked (F01)', async () => {
+    const store = openStore()
+    const capacity = new FakeBenchCapacity()
+    const { service } = rig(store, { capacity, probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    const held = grantedOf(await service.request('t1', 'a1'))
+    const holdId = service.runtime().leases[held.lease.leaseId]?.holdId!
+    // A delivery of another input took the reservation over; the worker is starting in that slot.
+    expect(capacity.consumeHold(holdId)).toBe(true)
+    advance(61_000)
+    service.reconcile()
+    expect(service.runtime().leases[held.lease.leaseId]).toMatchObject({ state: 'revoked' })
+    // The revoke must not free a slot the delivery owns; the delivery frees it when it ends.
+    expect(capacity.holdsFor('t1')).toEqual([holdId])
+    capacity.releaseHold(holdId)
+    expect(capacity.holdsFor('t1')).toEqual([])
+  })
+  it('does not free a newer reservation from an older delivery (F01)', () => {
+    const slots = new WorkerSlots(() => [], () => 1)
+    const first = slots.hold('t1', 60_000, Date.parse(AT))!
+    slots.consumeHold(first.id)
+    slots.releaseHold(first.id)
+    const second = slots.hold('t1', 60_000, Date.parse(AT) + 1)!
+    slots.freeClaim('t1', first.id)
+    expect(slots.used()).toBe(1)
+    slots.freeClaim('t1', second.id)
+    expect(slots.used()).toBe(0)
+  })
+  it('counts a pass in which every compatible device failed its probe once (F04)', async () => {
+    const store = openStore()
+    const { service } = rig(store, { probe: async () => 'offline' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    expect(await service.request('t1', 'a1')).toMatchObject({ state: 'queued' })
+    // Each pass finds every device offline; a person clears the device before the next attempt.
+    for (let pass = 0; pass < 5; pass++) { await service.pump(); service.clear('bench-a') }
+    expect(service.runtime().queue[0]).toMatchObject({ attempts: 5, blocked: { reason: 'no compatible device answered its probe' } })
+  })
+  it('clears the failure budget when the grant reaches its worker (F04)', async () => {
+    const store = openStore()
+    const { service } = rig(store, { probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    for (let cycle = 0; cycle < 4; cycle++) {
+      const held = grantedOf(await service.request('t1', 'a1'))
+      service.deliveryFailed(held.lease.leaseId, 'the grant could not be delivered')
+      service.clear('bench-a')
+    }
+    expect(service.runtime().queue[0]?.attempts).toBe(4)
+    const held = grantedOf(await service.request('t1', 'a1'))
+    service.delivered(held.lease.leaseId, clock())
+    const lease = service.runtime().leases[held.lease.leaseId]!
+    expect(lease.acceptedAt).toBe(clock())
+    expect(lease.request?.attempts).toBe(0)
+    expect(service.runtime().queue).toEqual([])
+  })
+  it('resumes the batch counter after a version-1 migration (F07)', async () => {
+    const store = openStore()
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    store.set(KV.bench.runtime, { version: 1, devices: {}, leases: {}, retired: {}, revision: 0,
+      queue: [{ id: requestId('t1', 'a1'), ticketId: 't1', assignmentId: 'a1', capabilities: [], readyAt: AT,
+        batchId: 'b-t1-3', attempts: 0 }] } as unknown as BenchRuntime)
+    const { service } = rig(store, { probe: async () => 'device' })
+    const first = grantedOf(await service.request('t1', 'a1'))
+    expect(service.runtime().leases[first.lease.leaseId]?.request?.batchId).toBe('b-t1-3')
+    releasedOf(await service.release('t1', 'a1', { leaseId: first.lease.leaseId }))
+    const second = grantedOf(await service.request('t1', 'a1'))
+    expect(service.runtime().leases[second.lease.leaseId]?.request?.batchId).toBe('b-t1-4')
+  })
+  it('binds a record write to the attempt it names (F08)', async () => {
+    const store = openStore()
+    const { service } = rig(store, { probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    const first = grantedOf(await service.request('t1', 'a1'))
+    releasedOf(await service.release('t1', 'a1', { leaseId: first.lease.leaseId }))
+    const second = grantedOf(await service.request('t1', 'a1'))
+    expect(() => service.record('t1', 'a1', first.lease.leaseId, { cases: [] })).toThrow(/not an active bench lease/)
+    expect(service.record('t1', 'a1', second.lease.leaseId, { cases: [] }).leaseId).toBe(second.lease.leaseId)
+  })
+  it('requires a completion time and real evidence paths for a pass (F09)', async () => {
+    const store = openStore()
+    const { service } = rig(store, { probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    const held = grantedOf(await service.request('t1', 'a1'))
+    service.record('t1', 'a1', held.lease.leaseId, { cases: [{ id: 'c1', expected: 'ok', actual: 'ok', outcome: 'passed' }],
+      installed: { artifact: 'app.apk', config: 'c', input: 'i' }, evidence: { logs: ['  '] } })
+    releasedOf(await service.release('t1', 'a1', { leaseId: held.lease.leaseId }))
+    const sealed = service.readRecord('t1', held.lease.leaseId)!
+    expect(sealed.verdict).toBe('insufficient-evidence')
+    expect(sealed.missing).toEqual(expect.arrayContaining(['completedAt', 'evidence']))
+  })
+  it('keeps a sealed record within 32 KiB however its facts grew (F10)', async () => {
+    const store = openStore()
+    const { service } = rig(store, { probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    const held = grantedOf(await service.request('t1', 'a1'))
+    let closed = false
+    for (let write = 0; write < 4 && !closed; write++) {
+      try {
+        service.record('t1', 'a1', held.lease.leaseId, { cases: Array.from({ length: 10 }, (_, index) => ({ id: `w${write}c${index}`,
+          expected: 'a'.repeat(500), actual: 'b'.repeat(500), outcome: 'passed' as const })), evidence: { logs: [`l${write}`] } })
+      } catch { closed = true }
+    }
+    expect(closed).toBe(true)
+    releasedOf(await service.release('t1', 'a1', { leaseId: held.lease.leaseId }))
+    const sealed = service.readRecord('t1', held.lease.leaseId)!
+    expect(Buffer.byteLength(JSON.stringify(sealed), 'utf8')).toBeLessThanOrEqual(32 * 1024)
+  })
+  it('cuts a record page at 8 KiB of summaries (F11)', async () => {
+    const store = openStore()
+    const { service } = rig(store, { probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    for (let index = 0; index < 50; index++) {
+      seed(store, 't1', `lease-${index}`, { batchId: `b-${'x'.repeat(200)}-${index}`, state: 'sealed', endedAt: AT,
+        endState: 'released', verdict: 'insufficient-evidence', started: 'reported', startedAt: AT })
+    }
+    const page = service.listRecords('t1', 0, 50)
+    expect(page.items.length).toBeLessThan(50)
+    expect(page.next_offset).toBe(page.items.length)
+    expect(Buffer.byteLength(JSON.stringify(page.items), 'utf8')).toBeLessThanOrEqual(8 * 1024)
   })
 })
