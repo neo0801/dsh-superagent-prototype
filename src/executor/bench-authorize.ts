@@ -7,17 +7,31 @@ import { liveTicket, runningAssignment, waitsForPerson, type Ticket } from '../c
 /** What a device ledger says about one configured device. */
 export type DeviceState = 'idle' | 'busy' | 'needs-check' | 'offline'
 export interface BenchDeviceRecord { state: DeviceState; serial: string; leaseId?: string; checkedAt?: string; note?: string }
+/** Why a request is held back for a person instead of being tried again by the host. */
+export interface BenchBlocked { reason: string; at: string; attempts: number }
 /** One queued request: the Assignment it is for, what it needs, and the one device it named, if any. */
-export interface BenchRequest { id: string; ticketId: string; assignmentId: string; capabilities: string[]; deviceId?: string; readyAt: string }
+export interface BenchRequest { id: string; ticketId: string; assignmentId: string; capabilities: string[]; deviceId?: string; readyAt: string
+  /** Failures counted across grants, deliveries and revocations; only a completed hand-off clears them. */
+  attempts: number
+  /** Set when those failures reached their limit: the request waits for a person's retry, and the host stops trying. */
+  blocked?: BenchBlocked
+  /** Why the host cannot grant the request now although it is still valid, such as the ticket waiting for a person. */
+  problem?: string }
 /** `active` may call the device; `revoking` refuses new calls while a release or a reconciliation ends them; `revoked` is done. */
 export type LeaseState = 'active' | 'revoking' | 'revoked'
 /** An exclusive hold of one device by one Assignment; `token` is the capability its wrapper calls prove. */
 export interface BenchLease { id: string; token: string; requestId: string; ticketId: string; assignmentId: string; deviceId: string
-  serial: string; actions: string[]; grantedAt: string; expiresAt: string; state: LeaseState }
+  serial: string; actions: string[]; grantedAt: string; expiresAt: string; state: LeaseState
+  /** The capacity reservation the grant was made against, absent when the worker already held a slot. */
+  holdId?: string
+  /** The request this lease was granted from, kept so a revocation can put it back with its ready time and failures. */
+  request?: BenchRequest }
 /** The one record the host keeps: the ledger, the FIFO of requests, the leases, and the evidence of devices it no longer names. */
 export interface BenchRuntime { version: 1; devices: Record<string, BenchDeviceRecord>; queue: BenchRequest[]; leases: Record<string, BenchLease>
-  retired: Record<string, { serial: string; leaseId?: string; note: string }> }
-export const emptyBenchRuntime = (): BenchRuntime => ({ version: 1, devices: {}, queue: [], leases: {}, retired: {} })
+  retired: Record<string, { serial: string; leaseId?: string; note: string }>
+  /** Bumped by every change that could make another request servable, so a grant's selection can be checked for staleness. */
+  revision: number }
+export const emptyBenchRuntime = (): BenchRuntime => ({ version: 1, devices: {}, queue: [], leases: {}, retired: {}, revision: 0 })
 
 /**
  * Whether an Assignment may hold a device: its ticket is live, it is the Assignment that runs it, no person is waited for,

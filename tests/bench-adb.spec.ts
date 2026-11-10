@@ -47,7 +47,7 @@ function validLease(overrides: Partial<BenchLease> = {}): BenchLease {
 }
 function validRuntime(overrides: { lease?: Partial<BenchLease>; device?: Partial<BenchDeviceRecord> } = {}): BenchRuntime {
   const lease = validLease(overrides.lease)
-  return { version: 1, queue: [], leases: { [lease.id]: lease }, retired: {},
+  return { version: 1, queue: [], leases: { [lease.id]: lease }, retired: {}, revision: 0,
     devices: { [DEVICE_ID]: { state: 'busy', serial: SERIAL, leaseId: lease.id, ...overrides.device } } }
 }
 /** A ticket that satisfies `benchEligible` for `ASSIGNMENT_ID` until an override breaks one of its conditions. */

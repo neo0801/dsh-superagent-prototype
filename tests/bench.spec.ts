@@ -13,7 +13,9 @@ import { Engine, key, waitsForPerson, type Assessor, type Assignment, type Bench
 import { Store } from '../src/app/store.ts'
 import { KV } from '../src/kv.ts'
 import { benchConfigOf, type BenchConfig, type BenchDevice } from '../src/deployment.ts'
-import { BenchService, benchGrantedInputId, type BenchHost, type BenchReleaseResult, type BenchRequestResult } from '../src/executor/bench.ts'
+import { BenchService, benchGrantedInputId, type BenchCapacity, type BenchHost, type BenchReleaseResult, type BenchRequestResult } from '../src/executor/bench.ts'
+import { FakeBenchCapacity } from './fixtures/bench-capacity.ts'
+import { WorkerSlots } from '../src/executor/dsh.ts'
 
 const AT = '2026-11-09T00:00:00.000Z'
 const sleep = (ms: number): Promise<void> => new Promise(resolve => { setTimeout(resolve, ms) })
@@ -59,17 +61,21 @@ interface Rig {
   engine: Engine
   service: BenchService
   host: BenchHost
+  /** The worker capacity the service reserves against. */
+  capacity: BenchCapacity
   /** The grants the service wrote through the Engine, and the Input ids it withdrew. */
   granted: BenchGrantedInput[]
   withdrawn: string[]
 }
 interface RigOptions {
   devices?: BenchDevice[]
-  config?: Partial<Pick<BenchConfig, 'adb' | 'adbServerSocket' | 'leaseSeconds'>>
+  config?: Partial<Pick<BenchConfig, 'adb' | 'adbServerSocket' | 'leaseSeconds' | 'holdSeconds'>>
   repository?: string | null
   probe?: BenchHost['probe']
   background?: BenchHost['background']
   lifetime?: AbortSignal
+  /** The worker capacity the grants reserve against; a fresh one by default. */
+  capacity?: BenchCapacity
   /** The gap before a failed allocation is tried again, shortened so a test need not wait a second. */
   retryMs?: number
   /** How many grant writes fail first, to exercise the bounded retry of an allocation pass that rolled back. */
@@ -80,6 +86,7 @@ interface RigOptions {
 /** A `BenchService` over `store`, with the real Engine writing the ledger's grants and withdrawals and the clock injected. */
 function rig(store: Store, options: RigOptions = {}): Rig {
   const granted: BenchGrantedInput[] = [], withdrawn: string[] = []
+  const capacity = options.capacity ?? new FakeBenchCapacity()
   let failing = options.failGrants ?? 0
   const engine = new Engine({ repo: store, scope, policy: () => policy, assessor, executor, outbox, now: clock })
   const host: BenchHost = {
@@ -98,6 +105,7 @@ function rig(store: Store, options: RigOptions = {}): Rig {
     lifetime: options.lifetime ?? new AbortController().signal,
     repository: () => options.repository === null ? undefined : options.repository ?? 'acme/widgets',
     background: options.background ?? (async () => []),
+    capacity: () => capacity,
     now: clock,
     ...options.probe ? { probe: options.probe } : {},
     ...options.retryMs === undefined ? {} : { retryMs: options.retryMs },
@@ -105,7 +113,7 @@ function rig(store: Store, options: RigOptions = {}): Rig {
   const service = new BenchService(host)
   // The runtime records the configured device ledger before any request, so a device must exist as idle first.
   if (options.recover !== false) service.recover()
-  return { store, engine, service, host, granted, withdrawn }
+  return { store, engine, service, host, capacity, granted, withdrawn }
 }
 
 const grantedOf = (result: BenchRequestResult): Extract<BenchRequestResult, { state: 'granted' }> => {
@@ -722,7 +730,7 @@ describe('allocation passes (B4, B12)', () => {
     const store = openStore()
     saveTicket(store, ticket('t1', [assignment('a1')]))
     store.set(KV.bench.runtime, { version: 1, devices: {}, queue: [{ id: key('bench-request', 't1', 'a1'), ticketId: 't1',
-      assignmentId: 'a1', capabilities: [], readyAt: AT }], leases: {}, retired: {} })
+      assignmentId: 'a1', capabilities: [], readyAt: AT, attempts: 0 }], leases: {}, retired: {}, revision: 0 })
     const probe = vi.fn(async () => 'device' as const)
     const { service } = rig(store, { probe })
     await service.pump()
@@ -867,5 +875,146 @@ describe('grant validation (B23)', () => {
     expect(service.grantValid('t1', expiringInput)).toBe(true)
     advance(60_000)
     expect(service.grantValid('t1', expiringInput)).toBe(false)
+  })
+})
+
+describe('capacity reservations (S1)', () => {
+  const queuedRequestId = (ticketId: string, assignmentId: string): string => key('bench-request', ticketId, assignmentId)
+  it('queues a request without taking the device while no worker slot is free', async () => {
+    const store = openStore()
+    const capacity = new FakeBenchCapacity()
+    capacity.free = false
+    const { service } = rig(store, { capacity, probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    expect(await service.request('t1', 'a1')).toMatchObject({ state: 'queued' })
+    const runtime = service.runtime()
+    expect(runtime.leases).toEqual({})
+    expect(runtime.devices['bench-a']).toMatchObject({ state: 'idle' })
+    expect(runtime.queue.map(item => item.ticketId)).toEqual(['t1'])
+  })
+  it('grants once capacity frees, with the reservation recorded on the lease', async () => {
+    const store = openStore()
+    const capacity = new FakeBenchCapacity()
+    capacity.free = false
+    const { service } = rig(store, { capacity, probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    expect(await service.request('t1', 'a1')).toMatchObject({ state: 'queued' })
+    capacity.free = true
+    await service.pump()
+    const lease = capacity.holdFor('t1')
+    expect(lease).toMatchObject({ consumed: false })
+    const held = Object.values(service.runtime().leases)
+    expect(held).toHaveLength(1)
+    expect(held[0]?.holdId).toBe(lease?.id)
+    expect(capacity.holdsFor('t1')).toEqual([lease?.id])
+  })
+  it('releases the reservation of a grant that rolled back before retrying it', async () => {
+    const store = openStore()
+    const capacity = new FakeBenchCapacity()
+    const { service } = rig(store, { capacity, probe: async () => 'device', failGrants: 1, retryMs: 5 })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    expect(await service.request('t1', 'a1')).toMatchObject({ state: 'queued' })
+    for (let attempt = 0; attempt < 100 && !Object.keys(service.runtime().leases).length; attempt++) await sleep(5)
+    expect(Object.keys(service.runtime().leases)).toHaveLength(1)
+    // The failed selection's reservation was released; only the successful grant's remains.
+    expect(capacity.holdsFor('t1')).toHaveLength(1)
+  })
+  it('restores a revoked grant to the queue with its ready time and one failure', async () => {
+    const store = openStore()
+    const { service } = rig(store, { probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    const held = grantedOf(await service.request('t1', 'a1'))
+    advance(1_000)
+    service.deliveryFailed(held.lease.leaseId, 'the grant could not be delivered')
+    const runtime = service.runtime()
+    expect(runtime.leases[held.lease.leaseId]).toMatchObject({ state: 'revoked' })
+    expect(runtime.devices['bench-a']).toMatchObject({ state: 'needs-check', note: 'the grant could not be delivered' })
+    expect(runtime.queue).toHaveLength(1)
+    expect(runtime.queue[0]).toMatchObject({ id: queuedRequestId('t1', 'a1'), readyAt: AT, attempts: 1 })
+    expect(runtime.queue[0]?.blocked).toBeUndefined()
+  })
+  it('blocks a request after five failed hand-offs and clears it on a person\'s retry', async () => {
+    const store = openStore()
+    const { service } = rig(store, { probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    for (let cycle = 0; cycle < 5; cycle++) {
+      const held = grantedOf(await service.request('t1', 'a1'))
+      service.deliveryFailed(held.lease.leaseId, 'the grant could not be delivered')
+      service.clear('bench-a')
+    }
+    const blocked = service.runtime().queue[0]
+    expect(blocked).toMatchObject({ attempts: 5 })
+    expect(blocked?.blocked).toMatchObject({ attempts: 5 })
+    expect(await service.request('t1', 'a1')).toMatchObject({ state: 'unavailable' })
+    expect(service.retry(queuedRequestId('t1', 'a1'))).toBe(true)
+    expect(service.runtime().queue[0]?.attempts).toBe(0)
+    expect(grantedOf(await service.request('t1', 'a1')).lease.deviceId).toBe('bench-a')
+  })
+  it('keeps the lease when a release reports the worker still busy', async () => {
+    const store = openStore()
+    const { service } = rig(store, { probe: async () => 'device', background: async () => ['shell job 1'] })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    const held = grantedOf(await service.request('t1', 'a1'))
+    expect(await service.release('t1', 'a1', { leaseId: held.lease.leaseId })).toMatchObject({ state: 'busy' })
+    const runtime = service.runtime()
+    expect(runtime.leases[held.lease.leaseId]).toMatchObject({ state: 'active' })
+    expect(runtime.devices['bench-a']).toMatchObject({ state: 'busy' })
+  })
+  it('gives a grant back when its reservation expires before delivery', async () => {
+    const store = openStore()
+    const { service } = rig(store, { probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    const held = grantedOf(await service.request('t1', 'a1'))
+    advance(61_000)
+    await service.pump()
+    const runtime = service.runtime()
+    expect(runtime.leases[held.lease.leaseId]).toMatchObject({ state: 'revoked' })
+    expect(runtime.devices['bench-a']).toMatchObject({ state: 'needs-check' })
+    expect(runtime.queue[0]).toMatchObject({ id: queuedRequestId('t1', 'a1'), attempts: 1 })
+  })
+  it('revokes a previous process\' lease on recovery and puts the request back', async () => {
+    const store = openStore()
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    const first = rig(store, { probe: async () => 'device' })
+    const held = grantedOf(await first.service.request('t1', 'a1'))
+    const second = rig(store, { probe: async () => 'device', recover: false })
+    second.service.recover()
+    const runtime = second.service.runtime()
+    expect(runtime.leases[held.lease.leaseId]).toMatchObject({ state: 'revoked' })
+    expect(runtime.devices['bench-a']).toMatchObject({ state: 'needs-check' })
+    expect(runtime.queue[0]).toMatchObject({ id: queuedRequestId('t1', 'a1'), attempts: 1 })
+  })
+})
+
+describe('worker slot reservations (S1)', () => {
+  const slots = (max: number, running: () => string[] = () => []): WorkerSlots => new WorkerSlots(running, () => max)
+  it('counts a reservation against the limit until it is released', () => {
+    const service = slots(1)
+    const hold = service.hold('t1', 60_000, Date.parse(AT))
+    expect(hold).toBeDefined()
+    expect(service.used()).toBe(1)
+    expect(service.hold('t2', 60_000, Date.parse(AT))).toBeUndefined()
+    expect(service.consumeHold(hold!.id)).toBe(true)
+    expect(service.used()).toBe(1)
+    service.releaseHold(hold!.id)
+    expect(service.used()).toBe(0)
+  })
+  it('adds no count when the ticket already holds a starting slot', () => {
+    const service = slots(1)
+    service.reserve('t1', 'wake')
+    const hold = service.hold('t1', 60_000, Date.parse(AT))
+    expect(hold).toMatchObject({ covered: true })
+    expect(service.used()).toBe(1)
+    service.releaseHold(hold!.id)
+    expect(service.used()).toBe(1)
+    service.free('t1')
+    expect(service.used()).toBe(0)
+  })
+  it('sweeps only reservations a delivery never took over', () => {
+    const service = slots(1)
+    const held = service.hold('t1', 60_000, Date.parse(AT))!
+    expect(service.sweepHolds(Date.parse(AT) + 59_000)).toEqual([])
+    expect(service.sweepHolds(Date.parse(AT) + 61_000).map(hold => hold.id)).toEqual([held.id])
+    expect(service.used()).toBe(0)
   })
 })

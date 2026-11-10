@@ -120,6 +120,7 @@ bench:
   adb: /opt/android/platform-tools/adb
   adbServerSocket: tcp:127.0.0.1:5037
   leaseSeconds: 1800
+  holdSeconds: 60
   devices:
     - id: bench-a
       serial: R58M123456A
@@ -137,6 +138,7 @@ bench:
 - `capabilities` are free-form names a Worker may ask for, such as `android-13`.
 - `actions` lists the adb device commands the device may run, such as `shell`, `install`, `push`, `pull` and `logcat`. `am`, `pm` and `getprop` go through `shell`. Server-wide commands, such as `start-server`, `kill-server`, `devices`, `connect` and `pair`, are refused at startup.
 - `leaseSeconds` is between 60 and 86400, defaulting to 1800.
+- `holdSeconds` is between 10 and 600, defaulting to 60: how long a grant may wait for the Worker to start before the host gives the device back.
 - The block is read once at start, so a change needs a restart.
 
 At start, a configured installation writes `<stateDir>/bench/bench-adb.mjs`, the wrapper through which Workers reach a leased device, and creates `<stateDir>/bench/calls/`, where a running call registers itself. The leases and the waiting requests live in the database under the `bench:runtime` key, so back up `orchestrator.sqlite` with the state directory. A device a restart or a release left `needs-check`, or a probe left `offline`, serves no Worker until a person confirms it free with `POST bench/<device id>/clear`; `GET bench` shows each device's state and the requests waiting. [003 Execution](003-execution.md) describes what a Worker gets and how it gives the device back.

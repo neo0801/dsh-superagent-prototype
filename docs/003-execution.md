@@ -85,6 +85,10 @@ An installation may name physical devices under `bench.devices` in its machine c
 
 A Worker asks for a device with `orchestrator_bench_request`, naming the capabilities it needs and optionally a device id. Requests wait in a queue: one whose devices are all busy or offline waits without holding a later request that another device can serve, and requests that want the same device keep their order. The Worker ends its turn, so the grant wakes it. A request no configured device could ever satisfy is answered `unavailable` instead of queued.
 
+Before granting, the host also reserves a Worker slot when the Assignment's Worker is not running, so a device is never held for a Worker the host has no slot to start; the delivery that starts the Worker takes the reservation over, and a grant that fails or whose reservation runs out (`bench.holdSeconds`) gives it back. The device and the slot are taken in the transaction below; a delivery that fails before the Worker starts revokes the grant and returns the request with its original place.
+
+Failures of one request count up: a rolled-back grant, a grant that could not be delivered, and a lease revoked while its Ticket still qualified each add one, and at five the request waits for a person instead of the host retrying. `POST bench/queue/<request id>/retry` clears the count. A revoked grant goes back to the queue with its original ready time when its Ticket still qualifies; a request whose Ticket ended, changed Assignment or was cancelled is removed, and one waiting because the Ticket waits for a person keeps its place and shows `problem` in `GET bench`.
+
 Before granting, the host runs `adb -s <serial> get-state` outside the database transaction. A device that does not answer `device` is `offline` and no lease is written. The grant itself is one transaction: the lease, the device's state, the request removed from the queue, and a `bench-granted` Input bound to the Assignment that asked for it. The Input carries the lease id, the token, the serial and the wrapper path.
 
 A Worker runs adb only through the generated wrapper:

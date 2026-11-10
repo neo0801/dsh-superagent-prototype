@@ -17,6 +17,7 @@ import type { BenchRequestResult, BenchReleaseResult } from '../src/executor/ben
 import { BenchService, type BenchHost } from '../src/executor/bench.ts'
 import { DshExecutor, benchGrantMessage, type ExecutorHost } from '../src/executor/dsh.ts'
 import { testDeployment } from './fixtures/deployment.ts'
+import { FakeBenchCapacity } from './fixtures/bench-capacity.ts'
 
 const AT = '2026-11-09T00:00:00.000Z'
 const wrapper = '/state/bench/bench-adb.mjs'
@@ -169,7 +170,9 @@ describe('orchestrator_bench_release duplicate release', () => {
         outbox: { send: () => {}, status: () => undefined, withdraw: () => {} }, now: () => AT })
       const base = ticket([assignment('assignment-1')])
       store.tickets.save(base)
+      const capacity = new FakeBenchCapacity()
       const host: BenchHost = { store, engine,
+        capacity: () => capacity,
         config: { adb: 'adb', leaseSeconds: 60,
           devices: [{ id: 'bench-a', serial: 'SERIAL-A', projects: [], capabilities: [], actions: ['shell'] }] },
         adb: 'adb', wrapper, stateDir: directory, lifetime: new AbortController().signal,

@@ -243,7 +243,7 @@ export class Runtime extends Service implements SourceHost {
     const runtime = this
     return new BenchService({ store, get engine() { return runtime.engine }, config, adb, wrapper, stateDir: this.machine.stateDir,
       lifetime: this.lifetime, repository: () => setup.configured() ? setup.deployment.repository : undefined,
-      background: ticketId => runtime.executor.backgroundOf(ticketId) })
+      background: ticketId => runtime.executor.backgroundOf(ticketId), capacity: () => runtime.executor.capacity() })
   }
   private async initialize(): Promise<void> {
     // Register management HTTP routes before setup completes so operators can fix setup problems in the UI.

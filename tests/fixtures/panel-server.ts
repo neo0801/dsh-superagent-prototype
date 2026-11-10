@@ -374,6 +374,7 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
       reasoning: { efforts: [{ id: 'high', name: 'High' }] } }] }] }) },
   'GET bench': { answer: () => ({ devices: [], queue: [] }) },
   'POST bench/:id/clear': { answer: () => ({ cleared: false }) },
+  'POST bench/queue/:id/retry': { answer: () => ({ retried: false }) },
   'GET prompts': { query: ['revision', 'offset'], answer: () => server.prompts },
   'PUT prompts': { body: true, answer: ({ body }) => {
     const { revision } = server.prompts

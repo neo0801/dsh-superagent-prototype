@@ -10,7 +10,7 @@ import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { randomBytes } from 'node:crypto'
 import type { Store } from '../app/store.ts'
-import type { BenchGrantedInput } from '../core/model.ts'
+import { liveTicket, runningAssignment, waitsForPerson, type BenchGrantedInput, type Ticket } from '../core/model.ts'
 import type { EngineForBench } from '../core/engine.ts'
 import { key } from '../core/ids.ts'
 import { KV } from '../kv.ts'
@@ -21,12 +21,31 @@ import { adbEnvironment, forgetBenchCalls, pendingBenchCalls, probeAdb, type Ben
 
 /** How long a release waits for the wrapper calls of a lease to end before it gives the device to a person instead. */
 const RELEASE_WAIT_MS = 2_000, RELEASE_POLL_MS = 50
+/** How long a grant's capacity reservation may wait for its delivery before the grant is given back. */
+const HOLD_SECONDS = 60, HOLD_SWEEP_MAX_MS = 5 * 60_000
 /** How long one `adb get-state` may take before the device counts as offline. */
 const PROBE_TIMEOUT_MS = 5_000
 /** Rounds of one allocation pass: each grants what it can, so this only bounds pathological churn. */
 const PUMP_ROUNDS = 32
 /** A grant that rolled back or a probe that failed is tried again, a bounded number of times, without a new request. */
 const PUMP_RETRY_MS = 1_000, PUMP_RETRY_ATTEMPTS = 5
+/** Failures of one request, across grants, deliveries and revocations, before it waits for a person's retry. */
+const FAILURE_LIMIT = 5
+
+/** The capacity side of a grant: what the executor host lends the bench service (see `DshExecutor.capacity`). */
+export interface BenchCapacity {
+  /** Whether the ticket's worker holds a slot now, in which case a grant needs no new reservation. */
+  isRunning(ticketId: string): boolean
+  /** A reservation of one slot, `undefined` when none is free, or a covered one when the ticket already starts. */
+  hold(ticketId: string, ttlMs: number, nowMs: number): { id: string; covered: boolean } | undefined
+  releaseHold(id: string): void
+  consumeHold(id: string): boolean
+  holdFor(ticketId: string): { id: string; consumed: boolean } | undefined
+  /** Releases reservations whose deadline passed, returning them so their grants can be revoked. */
+  sweep(nowMs: number): { id: string; ticketId: string }[]
+  /** Reservations still pending, for scheduling the sweep. */
+  pending(): { id: string; expiresAt: string }[]
+}
 /**
  * Thrown when a `bench-granted` Input stopped being deliverable while the Session was resolving: its lease was released,
  * revoked or expired, or the ticket changed. The Input is withdrawn, not recorded as a failed delivery.
@@ -46,6 +65,8 @@ export interface BenchHost {
   repository(): string | undefined
   /** What a worker's Session still runs after its turn, such as shell jobs and subagents, which a release waits out. */
   background(ticketId: string): Promise<string[]>
+  /** The executor host's worker capacity: a grant reserves a slot before it takes a device. */
+  capacity(): BenchCapacity
   probe?(serial: string, signal: AbortSignal): Promise<'device' | 'offline'>
   spawn?: BenchSpawn
   now?(): string
@@ -64,10 +85,32 @@ export type BenchReleaseResult = { state: 'released'; device_id: string; serial:
   | { state: 'not-held'; device_id?: string; device_state?: DeviceState }
   | { state: 'cancelled' }
 /** One device a worker's release left to a person's confirmation. */
-export interface BenchDeviceView { id: string; serial: string; state: DeviceState; lease_id?: string; ticket_id?: string; expires_at?: string; note?: string }
-export interface BenchView { devices: BenchDeviceView[]; queue: { request_id: string; ticket_id: string; device_id?: string; ready_at: string }[] }
+export interface BenchDeviceView { id: string; serial: string; state: DeviceState; lease_id?: string; ticket_id?: string; expires_at?: string; note?: string }export interface BenchView { devices: BenchDeviceView[]; queue: { request_id: string; ticket_id: string; device_id?: string; ready_at: string
+  /** Why the host cannot grant it now although it is still valid, such as the ticket waiting for a person. */
+  problem?: string }[] }
 
 const sleep = (ms: number): Promise<void> => new Promise(resolve => { setTimeout(resolve, ms).unref?.() })
+
+/**
+ * Why the host took a lease back. The reason decides the device's state and where its request goes: a retryable failure
+ * keeps the request with its ready time, while a request that can never be granted again is removed.
+ */
+export type BenchRevokeReason = 'delivery-failed' | 'expired' | 'restarted' | 'cancelled' | 'ticket-ended' | 'assignment-changed'
+  | 'temporarily-ineligible' | 'released-unconfirmed'
+/** Requests whose grant is gone for good; every other reason leaves the request waiting for the next device. */
+const REMOVES_REQUEST: ReadonlySet<BenchRevokeReason> = new Set(['cancelled', 'ticket-ended', 'assignment-changed', 'released-unconfirmed'])
+/** Reasons that count against the request's failure budget; a temporary inability to grant does not. */
+const COUNTS_FAILURE: ReadonlySet<BenchRevokeReason> = new Set(['delivery-failed', 'expired', 'restarted'])
+const REVOKE_TEXT: Readonly<Record<BenchRevokeReason, string>> = {
+  'delivery-failed': 'the grant could not be delivered to the worker',
+  expired: 'the lease expired',
+  restarted: 'the host restarted while the device was leased',
+  cancelled: 'the request was cancelled',
+  'ticket-ended': 'the ticket ended',
+  'assignment-changed': 'the ticket changed its Assignment',
+  'temporarily-ineligible': 'the ticket cannot be granted a device now',
+  'released-unconfirmed': 'a wrapper call did not end before the release did',
+}
 /** The stable request id of one Assignment: a re-request returns what is queued or held instead of queueing twice. */
 const benchRequestId = (ticketId: string, assignmentId: string): string => key('bench-request', ticketId, assignmentId)
 /** The Input id that names one lease's grant, so a repeated grant notification is the same Input. */
@@ -80,7 +123,9 @@ export const benchGrantedInputId = (leaseId: string): string => key('bench-grant
 export class BenchService {
   private pumping?: Promise<void>
   /** A pending retry of an allocation pass whose grant rolled back or whose probe failed. */
-  private retry?: ReturnType<typeof setTimeout>
+  private retryTimer?: ReturnType<typeof setTimeout>
+  /** A pending sweep of capacity reservations that no delivery took over. */
+  private holdTimer?: ReturnType<typeof setTimeout>
   /** Retries since the last external event, which resets them: a bounded effort, not a busy loop. */
   private attempts = 0
   constructor(private readonly host: BenchHost) {}
@@ -88,10 +133,19 @@ export class BenchService {
   /** The ledger as currently stored; a record this version does not read counts as empty, as the wrapper refuses it too. */
   runtime(): BenchRuntime {
     const stored = this.host.store.get(KV.bench.runtime)
-    return stored?.version === 1 ? stored : emptyBenchRuntime()
+    const runtime = stored?.version === 1 ? stored : emptyBenchRuntime()
+    // Records written before a field existed read with its default, so an upgrade keeps queued requests and leases.
+    runtime.revision ??= 0
+    for (const request of runtime.queue) request.attempts ??= 0
+    return runtime
   }
   private write(runtime: BenchRuntime): void { this.host.store.set(KV.bench.runtime, runtime) }
   private clock(): string { return this.host.now?.() ?? new Date().toISOString() }
+  private nowMs(): number { return Date.parse(this.clock()) }
+  private holdMs(): number { return (this.host.config.holdSeconds ?? HOLD_SECONDS) * 1000 }
+  private capacity(): BenchCapacity { return this.host.capacity() }
+  /** Records a change that may make another request servable, so a grant selected before it is re-evaluated. */
+  private bump(runtime: BenchRuntime): void { runtime.revision = (runtime.revision ?? 0) + 1 }
   private mutate<T>(work: (runtime: BenchRuntime) => T): T {
     return this.host.store.atomic(() => { const runtime = this.runtime(); const value = work(runtime); this.write(runtime); return value })
   }
@@ -121,7 +175,7 @@ export class BenchService {
         }
       }
       for (const lease of Object.values(runtime.leases)) {
-        if (lease.state !== 'revoked') this.revokeIn(runtime, lease.id, 'the host restarted while the device was leased')
+        if (lease.state !== 'revoked') this.revokeIn(runtime, lease.id, 'restarted', 'the host restarted while the device was leased')
       }
       for (const record of Object.values(runtime.devices)) {
         if (!record.leaseId) continue
@@ -142,8 +196,20 @@ export class BenchService {
       return { id: device.id, serial: device.serial, state: record?.state ?? 'idle',
         ...lease ? { lease_id: lease.id, ticket_id: lease.ticketId, expires_at: lease.expiresAt } : {},
         ...record?.note ? { note: record.note } : {} }
-    }), queue: runtime.queue.map(item => ({ request_id: item.id, ticket_id: item.ticketId,
-      ...item.deviceId ? { device_id: item.deviceId } : {}, ready_at: item.readyAt })) }
+    }), queue: runtime.queue.filter(item => !item.blocked).map(item => {
+      const problem = this.problemOf(item)
+      return { request_id: item.id, ticket_id: item.ticketId,
+        ...item.deviceId ? { device_id: item.deviceId } : {}, ready_at: item.readyAt, ...problem ? { problem } : {} }
+    }) }
+  }
+  /** Why a still-valid request cannot be granted now, derived from the ticket rather than stored. */
+  private problemOf(request: BenchRequest): string | undefined {
+    const ticket = this.host.store.tickets.get(request.ticketId)
+    if (!ticket || !liveTicket(ticket)) return undefined
+    if (runningAssignment(ticket)?.id !== request.assignmentId) return 'the Assignment changed; the request waits for a new one'
+    if (waitsForPerson(ticket)) return 'the ticket waits for a person'
+    if (ticket.delivery !== undefined) return 'the last input could not reach the worker'
+    return undefined
   }
 
   /**
@@ -156,13 +222,20 @@ export class BenchService {
     const requestId = benchRequestId(ticketId, assignmentId)
     const held = this.held(requestId)
     if (held) return { state: 'granted', lease: this.grantInfo(held), request_id: requestId }
+    const existing = this.runtime().queue.find(item => item.id === requestId)
+    if (existing?.blocked) {
+      return { state: 'unavailable', reason: 'the request is blocked for a person; retry or cancel it from the bench panel' }
+    }
+    if (existing?.problem) return { state: 'unavailable', reason: existing.problem }
     const capabilities = [...new Set((want.capabilities ?? []).map(value => value.trim()).filter(Boolean))]
     const deviceId = want.device?.trim() || undefined
     const compatible = this.compatible(capabilities, deviceId)
     if (!compatible.length) return { state: 'unavailable', reason: this.unavailableReason(capabilities, deviceId) }
     this.mutate(runtime => {
       if (runtime.queue.some(item => item.id === requestId)) return
-      runtime.queue.push({ id: requestId, ticketId, assignmentId, capabilities, ...deviceId ? { deviceId } : {}, readyAt: this.clock() })
+      runtime.queue.push({ id: requestId, ticketId, assignmentId, capabilities, ...deviceId ? { deviceId } : {},
+        readyAt: this.clock(), attempts: 0 })
+      this.bump(runtime)
     })
     await this.pump()
     const lease = this.held(requestId)
@@ -198,8 +271,9 @@ export class BenchService {
       this.host.engine.withdrawBench(lease.ticketId, [benchGrantedInputId(lease.id)])
     })
     if (!await this.callsEnded(lease.id)) {
-      this.revoke(lease.id, 'a wrapper call did not end before the release did')
-      return { state: 'needs-check', device_id: lease.deviceId, reason: 'a wrapper call did not end before the release did' }
+      const reason = 'a wrapper call did not end before the release did'
+      this.revoke(lease.id, 'released-unconfirmed', reason)
+      return { state: 'needs-check', device_id: lease.deviceId, reason }
     }
     const settled = this.settleRelease(lease)
     if (settled.state === 'released') {
@@ -227,13 +301,15 @@ export class BenchService {
       if (expired || !benchEligible(ticket, lease.assignmentId)) {
         const reason = expired ? 'the lease expired while the release waited for a call to end'
           : 'the ticket ended, waits for a person, or changed its Assignment while the release waited'
-        this.revokeIn(current, lease.id, reason)
+        this.revokeIn(current, lease.id, expired ? 'expired' : this.ineligibleReason(ticket, lease.assignmentId), reason)
         this.write(current)
         outcome = { state: 'needs-check', device_id: lease.deviceId, reason }
         return
       }
       delete current.leases[lease.id]
       current.devices[lease.deviceId] = { state: 'idle', serial: device.serial, checkedAt: this.clock() }
+      if (lease.holdId) { try { this.capacity().releaseHold(lease.holdId) } catch { /* No capacity host yet. */ } }
+      this.bump(current)
       this.write(current)
       outcome = { state: 'released', device_id: lease.deviceId, serial: lease.serial }
     })
@@ -269,26 +345,77 @@ export class BenchService {
       const runtime = this.runtime()
       const leases = Object.values(runtime.leases).filter(lease => lease.ticketId === ticketId && lease.state !== 'revoked')
       if (!leases.length) return
-      for (const lease of leases) this.revokeIn(runtime, lease.id, reason)
+      const ticket = this.host.store.tickets.get(ticketId)
+      // A stop takes the grant for good: the ticket ended, another Assignment took over, or this Assignment stopped.
+      const code = !ticket || !liveTicket(ticket) ? 'ticket-ended'
+        : runningAssignment(ticket)?.id !== leases[0]!.assignmentId ? 'assignment-changed' : 'cancelled'
+      let changed = false
+      for (const lease of leases) changed = this.revokeIn(runtime, lease.id, code, reason) || changed
+      if (changed) this.write(runtime)
+    })
+  }
+  /** The grant never reached its worker: revoke it, send the device to a person, and keep the request waiting. */
+  deliveryFailed(leaseId: string, detail: string): void {
+    this.host.store.atomic(() => {
+      const runtime = this.runtime()
+      if (!this.revokeIn(runtime, leaseId, 'delivery-failed', detail)) return
+      this.write(runtime)
+    })
+    this.scheduleHoldSweep()
+    void this.pump()
+  }
+  private revoke(leaseId: string, reason: BenchRevokeReason, detail: string): void {
+    this.host.store.atomic(() => {
+      const runtime = this.runtime()
+      if (!this.revokeIn(runtime, leaseId, reason, detail)) return
       this.write(runtime)
     })
   }
-  private revoke(leaseId: string, reason: string): void {
-    this.host.store.atomic(() => { const runtime = this.runtime(); this.revokeIn(runtime, leaseId, reason); this.write(runtime) })
+  /** Which permanent reason explains why a lease's ticket no longer qualifies, for the request it leaves behind. */
+  private ineligibleReason(ticket: Ticket | undefined, assignmentId: string): BenchRevokeReason {
+    if (!ticket || !liveTicket(ticket)) return 'ticket-ended'
+    if (runningAssignment(ticket)?.id !== assignmentId) return 'assignment-changed'
+    return 'temporarily-ineligible'
   }
-  /** Revoke one lease in `runtime`: the device needs a person's confirmation, and an undelivered grant is withdrawn. */
-  private revokeIn(runtime: BenchRuntime, leaseId: string, reason: string): void {
+  /**
+   * Revoke one lease in `runtime`: the device needs a person's confirmation, an undelivered grant is withdrawn, and the
+   * request is kept or removed by the reason. Idempotent per lease, so every termination path can call it.
+   */
+  private revokeIn(runtime: BenchRuntime, leaseId: string, reason: BenchRevokeReason, detail?: string): boolean {
     const lease = runtime.leases[leaseId]
-    if (!lease || lease.state === 'revoked') return
+    if (!lease || lease.state === 'revoked') return false
     lease.state = 'revoked'
     const device = runtime.devices[lease.deviceId]
     if (device && device.leaseId === lease.id) {
-      runtime.devices[lease.deviceId] = { state: 'needs-check', serial: device.serial, checkedAt: this.clock(), note: reason }
+      runtime.devices[lease.deviceId] = { state: 'needs-check', serial: device.serial, checkedAt: this.clock(),
+        note: detail ?? REVOKE_TEXT[reason] }
     }
     this.host.engine.withdrawBench(lease.ticketId, [benchGrantedInputId(lease.id)])
+    this.closeRequest(runtime, lease, reason, detail)
+    if (lease.holdId) { try { this.capacity().releaseHold(lease.holdId) } catch { /* No capacity host yet. */ } }
+    this.bump(runtime)
+    return true
+  }
+  /** Keep the request waiting again, or remove it, as the revocation reason says. */
+  private closeRequest(runtime: BenchRuntime, lease: BenchLease, reason: BenchRevokeReason, detail?: string): void {
+    if (REMOVES_REQUEST.has(reason)) return
+    const snapshot = lease.request
+    if (!snapshot) return
+    const counted = COUNTS_FAILURE.has(reason)
+    const attempts = snapshot.attempts + (counted ? 1 : 0)
+    const restored: BenchRequest = { id: snapshot.id, ticketId: snapshot.ticketId, assignmentId: snapshot.assignmentId,
+      capabilities: [...snapshot.capabilities], ...snapshot.deviceId ? { deviceId: snapshot.deviceId } : {},
+      readyAt: snapshot.readyAt, attempts }
+    if (reason === 'temporarily-ineligible') restored.problem = detail ?? REVOKE_TEXT[reason]
+    if (counted && attempts >= FAILURE_LIMIT) {
+      restored.blocked = { reason: detail ?? REVOKE_TEXT[reason], at: this.clock(), attempts }
+    }
+    const index = runtime.queue.findIndex(item => item.id === restored.id)
+    if (index >= 0) runtime.queue[index] = restored
+    else runtime.queue.push(restored)
   }
 
-  /** Revoke leases whose ticket, Assignment or time ran out, drop requests that no longer qualify, and carry on the queue. */
+  /** Revoke leases whose ticket, Assignment or time ran out, keep requests that may still qualify, and carry on. */
   reconcile(): void {
     if (this.host.lifetime.aborted) return
     let changed = false
@@ -299,16 +426,36 @@ export class BenchService {
         // and the release's own last transaction re-reads that result instead of overwriting it.
         if (lease.state === 'revoked') continue
         const ticket = this.host.store.tickets.get(lease.ticketId)
-        const reason = !benchEligible(ticket, lease.assignmentId) ? 'the ticket ended, waits for a person, or changed its Assignment'
-          : Date.parse(lease.expiresAt) <= Date.parse(this.clock()) ? 'the lease expired' : undefined
-        if (!reason) continue
-        this.revokeIn(runtime, lease.id, reason); changed = true
+        const code = !benchEligible(ticket, lease.assignmentId) ? this.ineligibleReason(ticket, lease.assignmentId)
+          : Date.parse(lease.expiresAt) <= Date.parse(this.clock()) ? 'expired' : undefined
+        if (!code) continue
+        const detail = code === 'expired' ? 'the lease expired' : 'the ticket ended, waits for a person, or changed its Assignment'
+        changed = this.revokeIn(runtime, lease.id, code, detail) || changed
       }
-      const queue = runtime.queue.filter(item => benchEligible(this.host.store.tickets.get(item.ticketId), item.assignmentId))
-      if (queue.length !== runtime.queue.length) { runtime.queue = queue; changed = true }
+      // Only a ticket that ended or changed its Assignment makes a request permanently invalid; one that merely waits for a
+      // person keeps its place and says why it cannot be granted.
+      if (this.prune(runtime)) changed = true
       if (changed) this.write(runtime)
     })
     if (changed) void this.pump()
+  }
+
+  /**
+   * A person clears a blocked request's failure budget: it waits again with the same ready time, batch and selection state,
+   * and the host stops trying until someone calls this.
+   */
+  retry(requestId: string): boolean {
+    const retried = this.mutate(runtime => {
+      const request = runtime.queue.find(item => item.id === requestId)
+      if (!request?.blocked) return false
+      delete request.blocked
+      request.attempts = 0
+      delete request.problem
+      this.bump(runtime)
+      return true
+    })
+    if (retried) void this.pump()
+    return retried
   }
 
   /** A person confirms a device is free: a `needs-check` or `offline` device goes idle, and the queue continues. */
@@ -318,6 +465,7 @@ export class BenchService {
       const record = runtime.devices[deviceId]
       if (!record || (record.state !== 'needs-check' && record.state !== 'offline')) return false
       runtime.devices[deviceId] = { state: 'idle', serial: record.serial, checkedAt: this.clock() }
+      this.bump(runtime)
       return true
     })
     if (!cleared) return false
@@ -343,35 +491,124 @@ export class BenchService {
   /** Start one pass, or join the one running, and arrange the bounded retry a failed pass deserves. */
   private kick(): Promise<void> {
     return this.pumping ??= this.pumpOnce().catch(() => { /* A probe or the Store failed; the retry below tries again. */ })
-      .finally(() => { this.pumping = undefined; this.planRetry() })
+      .finally(() => { this.pumping = undefined; this.planRetry(); this.scheduleHoldSweep() })
   }
   private async pumpOnce(): Promise<void> {
     const skip = new Set<string>()
     for (let round = 0; round < PUMP_ROUNDS; round++) {
       if (this.host.lifetime.aborted) return
-      const requests = this.queued(this.runtime())
-      if (!requests.length) return
-      let granted = false
-      for (const request of requests) {
+      const runtime = this.runtime()
+      // A request whose ticket ended or changed its Assignment can never be granted again; drop it before selecting.
+      if (this.prune(runtime)) { this.write(runtime); continue }
+      // A grant whose reservation ran out before its delivery is given back before a new one is made.
+      if (this.expireHolds()) continue
+      const revision = runtime.revision
+      const candidates = this.candidates(runtime, skip)
+      if (!candidates.length) return
+      let progress = false
+      for (const request of candidates) {
         if (this.host.lifetime.aborted) return
         const device = await this.choose(this.runtime(), request, skip)
         if (!device) continue
-        const outcome = this.commitGrant(request, device)
-        if (outcome === 'granted') granted = true
-        // A request that no longer qualifies is gone, so its device stays available for the ones behind it.
-        else if (outcome === 'failed') skip.add(device.id)
+        // A grant to a worker that is not running takes capacity before it takes the device, so a device is never held for a
+        // worker the host has no slot to start.
+        const running = this.capacity().isRunning(request.ticketId)
+        const hold = running ? undefined : this.capacity().hold(request.ticketId, this.holdMs(), this.nowMs())
+        if (!running && !hold) continue
+        const outcome = this.commitGrant(request, device, revision, hold?.id)
+        if (outcome === 'granted') { progress = true; break }
+        if (hold) this.capacity().releaseHold(hold.id)
+        if (outcome === 'stale') { progress = true; break }
+        if (outcome === 'dropped') { progress = true; continue }
+        this.markFailure(request.id, 'the grant rolled back or the device kept failing')
+        skip.add(device.id)
       }
-      if (!granted) return
+      if (!progress) return
     }
   }
-  private queued(runtime: BenchRuntime): BenchRequest[] {
-    return runtime.queue.slice().sort((a, b) => a.readyAt.localeCompare(b.readyAt) || a.id.localeCompare(b.id))
+  /** Drops requests whose ticket ended or changed its Assignment; a request waiting for a person stays with its problem. */
+  private prune(runtime: BenchRuntime): boolean {
+    const kept = runtime.queue.filter(item => {
+      const ticket = this.host.store.tickets.get(item.ticketId)
+      return !!ticket && liveTicket(ticket) && runningAssignment(ticket)?.id === item.assignmentId
+    })
+    if (kept.length === runtime.queue.length) return false
+    runtime.queue = kept
+    this.bump(runtime)
+    return true
+  }
+  /** Every change that could let another request be served first invalidates a grant selected before it. */
+  private candidates(runtime: BenchRuntime, skip: Set<string>): BenchRequest[] {
+    return runtime.queue.filter(request => !request.blocked && this.servable(runtime, request, skip))
+      .sort((a, b) => a.readyAt.localeCompare(b.readyAt) || a.id.localeCompare(b.id))
+  }
+  private servable(runtime: BenchRuntime, request: BenchRequest, skip: Set<string>): boolean {
+    const ticket = this.host.store.tickets.get(request.ticketId)
+    if (!benchEligible(ticket, request.assignmentId)) return false
+    return this.compatible(request.capabilities, request.deviceId).some(device => {
+      const record = runtime.devices[device.id]
+      return !!record && record.state === 'idle' && record.serial === device.serial && !skip.has(device.id)
+    })
   }
   /** A request still waiting although one of its devices is idle: a grant rollback or a failed probe, not a busy device. */
   private needsRetry(): boolean {
-    const runtime = this.runtime()
-    return this.queued(runtime).some(request => this.compatible(request.capabilities, request.deviceId)
-      .some(device => runtime.devices[device.id]?.state === 'idle'))
+    try { return this.candidates(this.runtime(), new Set()).length > 0 } catch { return false }
+  }
+  /** Counts a failure against one request and blocks it once the limit is reached. */
+  private markFailure(requestId: string, reason: string): void {
+    this.mutate(runtime => {
+      const request = runtime.queue.find(item => item.id === requestId)
+      if (!request || request.blocked) return
+      request.attempts += 1
+      if (request.attempts >= FAILURE_LIMIT) request.blocked = { reason, at: this.clock(), attempts: request.attempts }
+      this.bump(runtime)
+    })
+  }
+  /** Schedules one sweep for the earliest deadline of a reservation no delivery has taken over yet. */
+  private scheduleHoldSweep(): void {
+    this.cancelHoldTimer()
+    let earliest: number | undefined
+    try {
+      for (const hold of this.capacity().pending()) {
+        const at = Date.parse(hold.expiresAt)
+        if (Number.isFinite(at) && (earliest === undefined || at < earliest)) earliest = at
+      }
+    } catch { return }
+    if (earliest === undefined) return
+    const wait = Math.min(Math.max(earliest - this.nowMs(), 0) + 10, HOLD_SWEEP_MAX_MS)
+    this.holdTimer = setTimeout(() => { this.holdTimer = undefined; this.sweepHolds() }, wait)
+    this.holdTimer.unref?.()
+  }
+  private cancelHoldTimer(): void {
+    if (this.holdTimer === undefined) return
+    clearTimeout(this.holdTimer); this.holdTimer = undefined
+  }
+  /** A reservation that ended without a delivery takes its grant with it: the device goes to a person, the request waits. */
+  private sweepHolds(): void {
+    if (this.host.lifetime.aborted) return
+    const changed = this.expireHolds()
+    if (changed) void this.pump()
+    this.scheduleHoldSweep()
+  }
+  /** Revokes the grants whose capacity reservation expired unconsumed; returns whether anything changed. */
+  private expireHolds(): boolean {
+    let expired: { id: string; ticketId: string }[]
+    try { expired = this.capacity().sweep(this.nowMs()) } catch { return false }
+    if (!expired.length) return false
+    const holds = new Set(expired.map(hold => hold.id))
+    try {
+      return this.host.store.atomic(() => {
+        const runtime = this.runtime()
+        let changed = false
+        for (const lease of Object.values(runtime.leases)) {
+          if (lease.state === 'revoked' || !lease.holdId || !holds.has(lease.holdId)) continue
+          changed = this.revokeIn(runtime, lease.id, 'delivery-failed',
+            'the grant did not reach the worker before its capacity reservation ended') || changed
+        }
+        if (changed) this.write(runtime)
+        return changed
+      })
+    } catch { return false }
   }
   private planRetry(): void {
     // A pass can end after the host closed its Store, which has nothing left to grant.
@@ -381,12 +618,12 @@ export class BenchService {
     this.attempts++
     // One timer at a time: a pass that ends while another retry waits must not leave two chains running.
     this.cancelRetry()
-    this.retry = setTimeout(() => { this.retry = undefined; void this.kick() }, this.host.retryMs ?? PUMP_RETRY_MS)
-    this.retry.unref?.()
+    this.retryTimer = setTimeout(() => { this.retryTimer = undefined; void this.kick() }, this.host.retryMs ?? PUMP_RETRY_MS)
+    this.retryTimer.unref?.()
   }
   private cancelRetry(): void {
-    if (this.retry === undefined) return
-    clearTimeout(this.retry); this.retry = undefined
+    if (this.retryTimer === undefined) return
+    clearTimeout(this.retryTimer); this.retryTimer = undefined
   }
   /** The first idle device the request may use whose probe reports `device`; a device that does not goes offline for a person. */
   private async choose(runtime: BenchRuntime, request: BenchRequest, skip: Set<string>): Promise<BenchDevice | undefined> {
@@ -415,28 +652,36 @@ export class BenchService {
   /**
    * Grant the request its device in one transaction: re-read the ledger, the request and the ticket, and only then write the
    * lease, the busy device, and the Input that tells the worker, whose delivery effect is queued in the same transaction.
-   * `dropped` means the request no longer qualified and is gone, so the device stays free for the requests behind it.
+   * `stale` means another change invalidated the selection, `dropped` that the request can never be granted, `failed` that
+   * the device was taken meanwhile. Capacity is already reserved by the caller and released by it on every non-grant.
    */
-  private commitGrant(request: BenchRequest, device: BenchDevice): 'granted' | 'dropped' | 'failed' {
+  private commitGrant(request: BenchRequest, device: BenchDevice, revision: number, holdId?: string): 'granted' | 'dropped' | 'stale' | 'failed' {
     try {
       return this.host.store.atomic(() => {
         const runtime = this.runtime()
+        if (runtime.revision !== revision) return 'stale'
         const queued = runtime.queue.find(item => item.id === request.id)
-        const record = runtime.devices[device.id]
-        if (!queued || !record || record.state !== 'idle' || record.serial !== device.serial) return 'failed'
+        if (!queued || queued.blocked) return 'stale'
         const ticket = this.host.store.tickets.get(queued.ticketId)
-        if (!ticket || !benchEligible(ticket, queued.assignmentId)) {
+        if (!ticket || !liveTicket(ticket) || runningAssignment(ticket)?.id !== queued.assignmentId) {
           runtime.queue = runtime.queue.filter(item => item.id !== request.id)
+          this.bump(runtime)
           this.write(runtime)
           return 'dropped'
         }
+        if (!benchEligible(ticket, queued.assignmentId)) return 'stale'
+        const record = runtime.devices[device.id]
+        if (!record || record.state !== 'idle' || record.serial !== device.serial) return 'failed'
         const at = this.clock()
         const lease: BenchLease = { id: randomBytes(12).toString('hex'), token: randomBytes(24).toString('hex'), requestId: queued.id,
           ticketId: ticket.id, assignmentId: queued.assignmentId, deviceId: device.id, serial: device.serial, actions: [...device.actions],
-          grantedAt: at, expiresAt: new Date(Date.parse(at) + this.host.config.leaseSeconds * 1000).toISOString(), state: 'active' }
+          grantedAt: at, expiresAt: new Date(Date.parse(at) + this.host.config.leaseSeconds * 1000).toISOString(), state: 'active',
+          ...holdId ? { holdId } : {}, request: { ...queued } }
         runtime.leases[lease.id] = lease
         runtime.devices[device.id] = { state: 'busy', leaseId: lease.id, serial: device.serial, checkedAt: at }
+        // The request leaves the queue while its grant waits for the worker; the lease keeps it to restore on a revoke.
         runtime.queue = runtime.queue.filter(item => item.id !== request.id)
+        this.bump(runtime)
         this.write(runtime)
         this.host.engine.benchGranted(ticket.id, { id: benchGrantedInputId(lease.id), kind: 'bench-granted', leaseId: lease.id,
           requestId: lease.requestId, deviceId: lease.deviceId, serial: lease.serial, token: lease.token, expiresAt: lease.expiresAt,

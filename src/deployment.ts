@@ -64,9 +64,11 @@ export interface BenchConfig {
   /** The adb server every probe and wrapper call uses; a fixed local default when absent. */
   adbServerSocket?: string
   leaseSeconds: number
+  /** How long a grant's model-capacity reservation may wait for its delivery before the grant is given back. */
+  holdSeconds?: number
   devices: BenchDevice[]
 }
-const BENCH_KEYS = ['adb', 'adbServerSocket', 'leaseSeconds', 'devices'] as const
+const BENCH_KEYS = ['adb', 'adbServerSocket', 'leaseSeconds', 'holdSeconds', 'devices'] as const
 const DEVICE_KEYS = ['id', 'serial', 'projects', 'capabilities', 'actions', 'maintainer'] as const
 const benchText = (value: unknown, what: string): string => {
   if (typeof value !== 'string' || !value.trim()) throw new Error(`bench ${what} must be a non-empty string`)
@@ -134,7 +136,12 @@ export function benchConfigOf(value: unknown): BenchConfig | undefined {
   if (typeof seconds !== 'number' || !Number.isInteger(seconds) || seconds < 60 || seconds > 86_400) {
     throw new Error('bench leaseSeconds must be a whole number of seconds from 60 to 86400')
   }
-  return { adb, ...socket === undefined ? {} : { adbServerSocket: socket }, leaseSeconds: seconds, devices }
+  const hold = block.holdSeconds
+  if (hold !== undefined && (typeof hold !== 'number' || !Number.isInteger(hold) || hold < 10 || hold > 600)) {
+    throw new Error('bench holdSeconds must be a whole number of seconds from 10 to 600')
+  }
+  return { adb, ...socket === undefined ? {} : { adbServerSocket: socket }, leaseSeconds: seconds,
+    ...hold === undefined ? {} : { holdSeconds: hold }, devices }
 }
 
 /** Read machine settings and reject unknown configuration keys (naming where deprecated keys moved). */

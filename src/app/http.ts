@@ -40,7 +40,7 @@ export interface HttpHost {
   readonly engine: EngineForPeople
   readonly executor: Pick<DshExecutor, 'activeCount'>
   /** The bench devices this installation leases, which only an operator confirms as free; absent when none is configured. */
-  readonly bench?: Pick<BenchService, 'view' | 'clear'>
+  readonly bench?: Pick<BenchService, 'view' | 'clear' | 'retry'>
   readonly health: Record<string, Health>
   readonly machine: Machine
   readonly masterId: string
@@ -210,6 +210,8 @@ function routes(runtime: HttpHost): Routes {
     // The bench devices an operator may confirm free after a failed probe, an expiry or a restart that left a lease behind.
     'GET bench': () => runtime.bench?.view() ?? { devices: [], queue: [] },
     'POST bench/:id/clear': ({ params }) => ({ cleared: runtime.bench?.clear(decoded(params.id)) ?? false }),
+    // A request the host stopped trying after repeated failures: a person clears its failure budget.
+    'POST bench/queue/:id/retry': ({ params }) => ({ retried: runtime.bench?.retry(decoded(params.id)) ?? false }),
     'GET prompts': ({ query }) => { const { revision, offset } = PromptsQuery.parse(query); return promptsView(runtime, revision, offset) },
     'PUT prompts': async input => {
       const request = z.object({ config: z.unknown(), baseRevision: z.number().int().nonnegative() }).parse(await promptBody(input))

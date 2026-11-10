@@ -43,6 +43,7 @@ export interface Api {
   'GET models': { response: ModelCatalog }
 'GET bench': { response: BenchView }
 'POST bench/:id/clear': { response: { cleared: boolean } }
+'POST bench/queue/:id/retry': { response: { retried: boolean } }
   'GET prompts': { query?: { revision?: number; offset?: number }; response: PromptsView }
   'PUT prompts': { body: { config: PromptConfig; baseRevision: number }; response: { revision: number; context_delivery: Delivery } }
   'POST prompts/preview': { body: PromptConfig; response: ReturnType<Prompts['preview']> }
