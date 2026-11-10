@@ -2,6 +2,7 @@
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { UserError, key, latestReport, reached, runningAssignment, threadKey, type Ticket, type Trigger } from '../core/index.ts'
 import { batchOf, inputMessage, triggerMessage, workerSessionId } from '../executor/dsh.ts'
+import type { BenchService } from '../executor/bench.ts'
 import { readGithub } from '../sources/github-read.ts'
 import { feishuReferences, feishuRead } from '../sources/feishu-read.ts'
 import { feishuRef } from '../sources/feishu.ts'
@@ -38,6 +39,8 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'ticket/<id>/transcript', holds: 'its Executor Session\'s messages, newest first', executor: true },
   { name: 'ticket/<id>/message/<n>', holds: 'one message of that transcript', executor: true },
   { name: 'ticket/<id>/input/<id>', holds: 'one input it was delivered', executor: true },
+  { name: 'ticket/<id>/records', holds: 'its bench test records, newest first, with a cursor', executor: true },
+  { name: 'ticket/<id>/record/<id>', holds: 'one bench test record of that ticket', executor: true },
   { name: 'trigger/<id>', holds: 'a trigger\'s text, where it went, the message it replies to and the messages around it on its thread',
     executor: true },
   { name: 'settings', holds: 'settings by block, each with the revision a save names: the small blocks whole, the Policy and the Source '
@@ -68,6 +71,8 @@ export interface ResourceHost {
   mayRead(sessionId: string, revision: number): boolean
   feishuPageSize(): number
   sourceLink(trigger: Trigger, signal?: AbortSignal): Promise<{ source_url?: string; source_url_read?: string }>
+  /** The bench test records of a ticket; absent on an installation that leases no device. */
+  readonly bench?: Pick<BenchService, 'listRecords' | 'readRecord'>
 }
 export interface MainResourceHost extends ResourceHost {
   readonly sessions: Pick<Sessions, 'status' | 'modelRetry'>
@@ -258,6 +263,17 @@ const ROUTES: readonly Route[] = [
         ? newestPage(ticket.assignments, read.offset, size, item => assignmentLine(ticket, item), resource)
         : newestPage(ticket.inputs, read.offset, size, input => inputLine(ticket, input, !!ticketId), resource)
       return { items, next_offset: next_offset ?? null }
+    }
+    // Bench test records: summaries newest first with a cursor, and one full record by its id. Both keep the ticket
+    // ownership check above; the host never verifies the evidence itself.
+    if (section === 'records') {
+      if (part !== undefined) throw new Error('Unknown context resource')
+      return host.bench?.listRecords(id, read.offset, read.limit ?? 10) ?? { items: [], next_offset: null }
+    }
+    if (section === 'record' && part) {
+      const record = host.bench?.readRecord(id, part)
+      if (!record) throw new Error('Unknown bench test record')
+      return record
     }
     let body: string
     if (section === 'input' && part) {

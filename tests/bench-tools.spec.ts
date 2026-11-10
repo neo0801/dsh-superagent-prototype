@@ -51,7 +51,8 @@ const run = (tool: Tool): Run => ((args: Record<string, unknown>) =>
 
 /** The tools over a ticket the store may replace between calls, so the running Assignment is read when the tool executes. */
 function toolsFor(options: { current: () => Ticket | undefined; request: BenchRequestResult; release?: BenchReleaseResult }) {
-  const bench = { request: vi.fn(async () => options.request), release: vi.fn(async () => options.release ?? { state: 'cancelled' as const }) }
+  const bench = { request: vi.fn(async () => options.request), release: vi.fn(async () => options.release ?? { state: 'cancelled' as const }),
+    record: vi.fn(() => { throw new Error('this test does not record') }) }
   const store = { tickets: { get: () => options.current() } } as unknown as BenchToolsHost['store']
   const tools = benchTools({ bench, store }, options.current() ?? ticket([assignment('assignment-1')]))
   return { bench, tools, request: findTool(tools, 'orchestrator_bench_request'), release: findTool(tools, 'orchestrator_bench_release') }

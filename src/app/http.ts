@@ -40,7 +40,7 @@ export interface HttpHost {
   readonly engine: EngineForPeople
   readonly executor: Pick<DshExecutor, 'activeCount'>
   /** The bench devices this installation leases, which only an operator confirms as free; absent when none is configured. */
-  readonly bench?: Pick<BenchService, 'view' | 'clear' | 'retry' | 'setLevel' | 'reorder'>
+  readonly bench?: Pick<BenchService, 'view' | 'clear' | 'retry' | 'setLevel' | 'reorder' | 'listRecords' | 'readRecord'>
   readonly health: Record<string, Health>
   readonly machine: Machine
   readonly masterId: string
@@ -233,6 +233,17 @@ function routes(runtime: HttpHost): Routes {
     'POST bench/queue/:id/retry': async ({ params, body }) => {
       const retry = z.object({ operator: z.string().min(1).max(120).optional() }).strict().parse((await body()) ?? {})
       return { retried: runtime.bench?.retry(decoded(params.id), retry.operator) ?? false }
+    },
+    // The test records a Ticket's bench attempts left behind: summaries with a cursor, and one full record by its id.
+    'GET tickets/:id/records': ({ params, query }) => {
+      const page = z.object({ offset: z.coerce.number().int().nonnegative().optional(),
+        limit: z.coerce.number().int().positive().optional() }).strict().parse(query ?? {})
+      return runtime.bench?.listRecords(decoded(params.id), page.offset ?? 0, page.limit ?? 20) ?? { items: [], next_offset: null }
+    },
+    'GET tickets/:id/records/:recordId': ({ params }) => {
+      const record = runtime.bench?.readRecord(decoded(params.id), decoded(params.recordId))
+      if (!record) throw new RouteError(404, 'this ticket has no such bench test record')
+      return record
     },
     'GET prompts': ({ query }) => { const { revision, offset } = PromptsQuery.parse(query); return promptsView(runtime, revision, offset) },
     'PUT prompts': async input => {

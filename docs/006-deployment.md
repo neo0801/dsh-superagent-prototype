@@ -144,6 +144,12 @@ bench:
 - `operators` is an optional list of declared names allowed to change levels or order; without it any declared name is accepted. The name is a declaration, not a verified identity.
 - The block is read once at start, so a change needs a restart.
 
+#### Bench test records
+
+A bench attempt leaves a record: the Worker writes its facts with `orchestrator_bench_record` (the cases, what was installed, where the evidence lies under `bench-evidence/<batch id>/<lease id>/`, and when the test completed), and the host seals the record when the device is released or revoked and derives the verdict (`passed`, `failed`, `insufficient-evidence`, `interrupted`, or `open` while the attempt runs). Records are listed at `GET tickets/<ticket id>/records` with summaries and `next_offset`, and read whole at `GET tickets/<ticket id>/records/<record id>`; a Worker reads the same two as `ticket/<id>/records` and `ticket/<id>/record/<id>`.
+
+A Ticket holds at most 200 records. At the limit it gets no further device until a person archives records out of band or the Ticket ends, and `GET bench` shows the waiting request with `problem: "record-quota"`. The host records the paths and the facts, never the evidence content: a path that does not exist, a screenshot that shows something else, or a case marked `passed` that did not run are not detected. A wrapper call appends `{at, action}` to `stateDir/bench/executions/<lease id>.log`, which the record reports as `started` and `startedAt`; deleting that log loses the evidence of a start without relaxing any requirement.
+
 At start, a configured installation writes `<stateDir>/bench/bench-adb.mjs`, the wrapper through which Workers reach a leased device, and creates `<stateDir>/bench/calls/`, where a running call registers itself. The leases and the waiting requests live in the database under the `bench:runtime` key, so back up `orchestrator.sqlite` with the state directory. A device a restart or a release left `needs-check`, or a probe left `offline`, serves no Worker until a person confirms it free with `POST bench/<device id>/clear`; `GET bench` shows each device's state and the requests waiting. [003 Execution](003-execution.md) describes what a Worker gets and how it gives the device back.
 
 ## Start and stop
@@ -238,6 +244,8 @@ Agents may rely on these routes and fields. The other routes in `src/app/api.ts`
 | `POST bench/queue/<request id>/level` with `{"operator", "level", "reason"}` | Raises or lowers a waiting request: its `level`, `effective_level` and new `queue_version`. Only a request that holds no device can change, and the operator is recorded as a declaration (`actorVerified: false`) |
 | `POST bench/queue/<request id>/reorder` with `{"operator", "request_id"?, "before"?, "after"?, "queue_version", "reason"}` | Moves a waiting request before or after another of the same effective level that shares a compatible device; with no `request_id`, `before` moves it to the front and `after` to the back. Returns `moved`, the new waiting `position` and `queue_version`; a `queue_version` that no longer matches answers 409 with the current one |
 | `POST bench/queue/<request id>/retry` with `{"operator"}` | Clears a blocked request's failures so the host tries it again in its old place: `retried`, and `false` for a request that is not blocked |
+| `GET tickets/<ticket id>/records` with `?offset=&limit=` | The ticket's bench test records as summaries (`recordId`, `leaseId`, `batchId`, `started`, `startedAt`, `verdict`, `endedAt`, `endState`, `caseCount`), newest first, with `next_offset` |
+| `GET tickets/<ticket id>/records/<record id>` | One full record: the host's identities and scheduling evidence, the cases, what was installed, the evidence paths, `missing`, `truncated` and the derived `verdict`. 404 for a record of another ticket or none |
 
 Health entries are grouped by responsibility:
 

@@ -3,7 +3,7 @@
  * leased device. Both use the same fixed adb server, and neither reads a caller's own server options.
  */
 import { spawn } from 'node:child_process'
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, rmdirSync, rmSync, unlinkSync } from 'node:fs'
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, rmdirSync, rmSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { randomBytes } from 'node:crypto'
@@ -143,6 +143,13 @@ export async function runBenchAdb(argv: readonly string[], options: BenchAdbOpti
     }
     const refusal = benchRefusal(snapshot.runtime, snapshot.ticket, { leaseId, token: call.token }, new Date().toISOString())
     if (refusal) return refuse(`bench call refused: ${BENCH_REFUSALS[refusal]}`)
+    // The host records that a call was allowed as evidence of a start. The log gates nothing: deleting it removes no
+    // requirement, so a record with no log shows `started: 'unknown'` rather than making anything stricter.
+    try {
+      const executions = join(options.stateDir, 'bench', 'executions')
+      mkdirSync(executions, { recursive: true, mode: 0o700 })
+      appendFileSync(join(executions, `${leaseId}.log`), `${JSON.stringify({ at: new Date().toISOString(), action: call.action })}\n`)
+    } catch { /* Evidence only: the call proceeds even when the log cannot be written. */ }
     return await run(lease.serial, call.action, call.args)
   } finally {
     try { unlinkSync(callFile) } catch { /* The registry lost the file, or the call never created it. */ }

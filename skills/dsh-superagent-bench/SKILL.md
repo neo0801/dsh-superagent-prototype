@@ -22,6 +22,11 @@ Keep the evidence a person needs from a device: the exact actions you ran, their
 Capture logs and screenshots into the worktree, never into the state directory, and clean temporary device files you created (`shell rm`) before releasing.
 A long action belongs in a background shell job, but the device stays leased until you release it and a release is refused while that job runs.
 
+Record what each attempt tested with `orchestrator_bench_record` before you release: one or more calls per attempt on its lease, with the cases (`id`, `expected`, `actual`, and `outcome` as `passed`, `failed` or `insufficient-evidence`), what you installed (`installed.artifact`, plus `installed.config` and `installed.input`, or `na` for a field that does not apply to this test), where the evidence lives (`evidence.logs`, `evidence.screenshots`, `evidence.artifacts`), and `completed_at` when the test finished. A later attempt on a new lease is a new record; a retry keeps the batch.
+Take the expected result from the requirement or acceptance case the test covers and name it in the case `note`; do not invent a pass standard.
+Put evidence under `bench-evidence/<batch_id>/<lease_id>/` in the worktree, with names that say what they show (`logcat-install.txt`, `screenshot-01.png`), and list those paths in the record. The host never reads the files, so a person relies on the paths being right.
+The host derives the verdict: a failed case fails; no cases, a missing required field, or an `insufficient-evidence` case needs more evidence; an abnormal end without `completed_at` is interrupted, with the missing fields listed; only all-passed cases with every required field pass. A test you did not record before releasing stays `insufficient-evidence`, and an attempt with no record at all is not a completed test.
+
 Release the device with `orchestrator_bench_release` and its `lease_id` before you report `ready`, `blocked`, `failed` or `dropped`; the host does not take back a lease a worker keeps.
 To give up a request still waiting for a device, call `orchestrator_bench_release` with its `request_id` instead.
 If a release reports `busy`, stop or wait for the shell jobs and subagents it names and release again; if it reports `needs-check`, the device needs a person to confirm it, which is a finding to report rather than a reason to retry.

@@ -6,7 +6,7 @@
  * A device reaches a worker only as a `bench-granted` Input bound to its Assignment, and every wrapper call re-checks that
  * lease against the same ledger, so the Worker's own Session cannot hand a device to another ticket.
  */
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { randomBytes } from 'node:crypto'
 import type { Store } from '../app/store.ts'
@@ -32,6 +32,78 @@ const PUMP_ROUNDS = 32
 const PUMP_RETRY_MS = 1_000, PUMP_RETRY_ATTEMPTS = 5
 /** Failures of one request, across grants, deliveries and revocations, before it waits for a person's retry. */
 const FAILURE_LIMIT = 5
+/** Records one Ticket may hold: at the limit it gets no device until a person archives records or the Ticket ends. */
+const RECORD_LIMIT = 200
+/** What a Worker may write in one call, and how large one record may grow. */
+const RECORD_PAYLOAD_BYTES = 28 * 1024, RECORD_BYTES = 32 * 1024
+/** The host-only suffix (scheduling evidence, missing list, end state) is trimmed to this budget, never refused. */
+const RECORD_HOST_BYTES = 4096
+const MAX_CASES = 50
+/** The end state each revocation reason seals into its lease's record. */
+const END_STATE_OF: Readonly<Record<BenchRevokeReason, BenchEndState>> = { 'delivery-failed': 'revoked', expired: 'expired',
+  restarted: 'restarted', cancelled: 'cancelled', 'ticket-ended': 'ticket-ended', 'assignment-changed': 'assignment-changed',
+  'temporarily-ineligible': 'revoked', 'released-unconfirmed': 'released-unconfirmed' }
+
+/** What a Worker may write to its open record; every identity and derived field is the host's. */
+export interface BenchRecordChange { cases?: BenchCase[]; installed?: BenchInstalled; na?: { config?: true; input?: true }
+  evidence?: BenchEvidence; completedAt?: string; note?: string }
+/** The required facts a record lacks, in a stable order the host derives rather than the Worker states. */
+export function requiredMissingOf(record: BenchRecord): string[] {
+  const missing: string[] = []
+  if (!record.installed?.artifact) missing.push('installed.artifact')
+  if (!record.installed?.config && !record.na?.config) missing.push('installed.config')
+  if (!record.installed?.input && !record.na?.input) missing.push('installed.input')
+  if (!Object.values(record.evidence ?? {}).some(list => (list?.length ?? 0) > 0)) missing.push('evidence')
+  if (!record.cases.length) missing.push('cases')
+  for (const item of record.cases) {
+    if (!item.expected) missing.push(`case:${item.id}:expected`)
+    if (!item.actual) missing.push(`case:${item.id}:actual`)
+  }
+  return missing
+}
+/**
+ * The verdict the host derives from a record's facts: a Worker never states it. `open` while the record is open; then an
+ * abnormal end without a completed time is `interrupted`; a failed case fails; an insufficient case, no cases, or a missing
+ * required fact is `insufficient-evidence`; and only then all-passed is `passed`. An abnormal end after a completed record
+ * is judged by the facts, not by how the lease ended.
+ */
+export function verdictOf(record: BenchRecord): BenchVerdict {
+  if (record.state !== 'sealed') return 'open'
+  if (record.endState !== 'released' && !record.completedAt) return 'interrupted'
+  if (record.cases.some(item => item.outcome === 'failed')) return 'failed'
+  if (record.cases.some(item => item.outcome === 'insufficient-evidence')) return 'insufficient-evidence'
+  if (!record.cases.length) return 'insufficient-evidence'
+  if (record.missing.length || requiredMissingOf(record).length) return 'insufficient-evidence'
+  return 'passed'
+}
+/** The host-only part of a record whose serialized size is budgeted. */
+const hostSuffixOf = (record: BenchRecord): unknown => ({ scheduling: record.scheduling ?? {}, missing: record.missing,
+  endState: record.endState, endedAt: record.endedAt, verdict: record.verdict, truncated: record.truncated })
+/** Keeps the host-only fields within their budget by trimming narrative in a fixed order; the seal is still written. */
+export function trimHostSuffix(record: BenchRecord): void {
+  const bytes = (): number => Buffer.byteLength(JSON.stringify(hostSuffixOf(record)), 'utf8')
+  if (bytes() <= RECORD_HOST_BYTES) return
+  record.truncated = true
+  if (record.scheduling?.reason) record.scheduling.reason = record.scheduling.reason.slice(0, 200)
+  if (record.scheduling?.reorder) record.scheduling.reorder.reason = record.scheduling.reorder.reason.slice(0, 200)
+  record.missing = record.missing.slice(0, 20).map(item => item.slice(0, 100))
+  if (bytes() <= RECORD_HOST_BYTES) return
+  if (record.scheduling) delete record.scheduling.reason
+  while (bytes() > RECORD_HOST_BYTES && record.missing.length) record.missing.pop()
+  if (bytes() > RECORD_HOST_BYTES && record.scheduling) delete record.scheduling.reorder
+}
+/** The bytes one record serializes to. */
+export const recordBytes = (record: BenchRecord): number => Buffer.byteLength(JSON.stringify(record), 'utf8')
+/** What a list entry carries: enough to choose a record, with the full record behind its own entry. */
+export const recordSummary = (record: BenchRecord): { recordId: string; leaseId: string; batchId: string; started: 'reported' | 'unknown'
+  startedAt?: string; verdict: BenchVerdict; endedAt?: string; endState?: BenchEndState; caseCount: number } =>
+  ({ recordId: record.recordId, leaseId: record.leaseId, batchId: record.batchId, started: record.started,
+    ...record.startedAt ? { startedAt: record.startedAt } : {}, verdict: record.verdict, ...record.endedAt ? { endedAt: record.endedAt } : {},
+    ...record.endState ? { endState: record.endState } : {}, caseCount: record.cases.length })
+const mergeEvidence = (current: BenchEvidence, change: BenchEvidence | undefined): BenchEvidence =>
+  !change ? current : { ...current, ...change.logs ? { logs: [...new Set([...(current.logs ?? []), ...change.logs])] } : {},
+    ...change.screenshots ? { screenshots: [...new Set([...(current.screenshots ?? []), ...change.screenshots])] } : {},
+    ...change.artifacts ? { artifacts: [...new Set([...(current.artifacts ?? []), ...change.artifacts])] } : {} }
 
 /** The capacity side of a grant: what the executor host lends the bench service (see `DshExecutor.capacity`). */
 export interface BenchCapacity {
@@ -54,7 +126,7 @@ export interface BenchCapacity {
 export class BenchWithdrawn extends Error {}
 
 export interface BenchHost {
-  readonly store: Pick<Store, 'get' | 'set' | 'atomic' | 'tickets'>
+  readonly store: Pick<Store, 'get' | 'set' | 'keys' | 'atomic' | 'tickets'>
   readonly engine: Pick<EngineForBench, 'benchGranted' | 'withdrawBench'>
   readonly config: BenchConfig
   /** The resolved adb executable and the wrapper script workers call; neither comes from the worker. */
@@ -102,6 +174,40 @@ export interface BenchView { devices: BenchDeviceView[]; queue: BenchQueueView[]
 export class BenchConflict extends Error {
   constructor(readonly queueVersion: number) { super('the queue changed since this change was decided; read the queue again') }
 }
+/** One case a Worker ran: what it expected, what it saw, and its own reading of the outcome. */
+export interface BenchCase { id: string; expected: string; actual: string; outcome: 'passed' | 'failed' | 'insufficient-evidence'
+  note?: string }
+/** What a Worker installed for the test; the host never verifies it. */
+export interface BenchInstalled { artifact: string; config?: string; input?: string }
+/** Where the evidence of a test lives, by path or name; the host never reads it. */
+export interface BenchEvidence { logs?: string[]; screenshots?: string[]; artifacts?: string[] }
+/** What the host derives from a record's facts; a Worker never states it. */
+export type BenchVerdict = 'open' | 'passed' | 'failed' | 'interrupted' | 'insufficient-evidence'
+/** Why an abnormal end took the device back, recorded on the lease's record. */
+export type BenchEndState = 'released' | 'expired' | 'restarted' | 'revoked' | 'cancelled' | 'ticket-ended'
+  | 'assignment-changed' | 'released-unconfirmed'
+/** One test attempt on one lease: opened when the device is granted, sealed when the lease ends. */
+export interface BenchRecord { recordId: string; ticketId: string; assignmentId: string; leaseId: string; deviceId: string; serial: string
+  batchId: string; version: BenchVersion; grantedAt: string; scheduling?: BenchScheduling
+  state: 'open' | 'sealed'
+  /** Whether a wrapper call reported a start; the log is evidence of a start, never a security decision. */
+  started: 'reported' | 'unknown'
+  /** The time the wrapper reported, not the time the host read it; `observedAt` is the host's reading time. */
+  startedAt?: string
+  observedAt: string
+  cases: BenchCase[]
+  installed?: BenchInstalled
+  na?: { config?: true; input?: true }
+  evidence: BenchEvidence
+  completedAt?: string
+  note?: string
+  endState?: BenchEndState
+  endedAt?: string
+  /** Required facts the record lacks, derived rather than stored by the Worker. */
+  missing: string[]
+  /** Whether the host-only fields had to be trimmed to fit their budget; a seal is never refused for size. */
+  truncated: boolean
+  verdict: BenchVerdict }
 
 const sleep = (ms: number): Promise<void> => new Promise(resolve => { setTimeout(resolve, ms).unref?.() })
 
@@ -262,8 +368,20 @@ export class BenchService {
     }
     return changed
   }
-  private audit(runtime: BenchRuntime, entry: BenchAuditEntry): void {
-    runtime.audit.push(entry)
+  /** Clears a temporary problem once the ticket qualifies again; the record quota itself is not temporary. */
+  private refreshProblems(runtime: BenchRuntime): boolean {
+    let changed = false
+    for (const request of runtime.queue) {
+      if (!request.problem || request.problem === 'record-quota') continue
+      const ticket = this.host.store.tickets.get(request.ticketId)
+      if (!benchEligible(ticket, request.assignmentId)) continue
+      delete request.problem
+      this.bump(runtime)
+      changed = true
+    }
+    return changed
+  }
+  private audit(runtime: BenchRuntime, entry: BenchAuditEntry): void {    runtime.audit.push(entry)
     if (runtime.audit.length > 200) runtime.audit.splice(0, runtime.audit.length - 200)
   }
   /** Whether two requests could be served by one device, the condition for moving one past the other. */
@@ -332,7 +450,8 @@ export class BenchService {
         ...lease ? { lease_id: lease.id, ticket_id: lease.ticketId, expires_at: lease.expiresAt } : {},
         ...record?.note ? { note: record.note } : {} }
     }), queue: waiting.map((item, index) => {
-      const problem = this.problemOf(item)
+      // A stored problem (such as a full record quota) outranks the one derived from the ticket.
+      const problem = item.problem ?? this.problemOf(item)
       const effective = this.effectiveLevel(item)
       return { request_id: item.id, ticket_id: item.ticketId, ...item.deviceId ? { device_id: item.deviceId } : {},
         level: item.level, effective_level: effective, promoted: effective === 'urgent' && item.level !== 'urgent',
@@ -390,9 +509,13 @@ export class BenchService {
     await this.pump()
     const lease = this.held(requestId)
     if (lease) return { state: 'granted', lease: this.grantInfo(lease), request_id: requestId }
-    if (this.runtime().queue.some(item => item.id === requestId)) {
-      return { state: 'queued', request_id: requestId, devices: compatible.map(device => device.id).join(', ') }
+    const waiting = this.runtime().queue.find(item => item.id === requestId)
+    if (waiting?.problem) {
+      return { state: 'unavailable', reason: waiting.problem === 'record-quota'
+        ? 'this ticket reached its bench record quota (200); archive records or end the ticket before another attempt'
+        : waiting.problem }
     }
+    if (waiting) return { state: 'queued', request_id: requestId, devices: compatible.map(device => device.id).join(', ') }
     return { state: 'unavailable', reason: 'the request was withdrawn before a device was free' }
   }
 
@@ -531,6 +654,8 @@ export class BenchService {
       if (lease.holdId) { try { this.capacity().releaseHold(lease.holdId) } catch { /* No capacity host yet. */ } }
       // A released request is done, so its place in the queue goes with it; a retest asks again as a new batch.
       this.dropOrder(current, lease.requestId)
+      // Sealing happens with the release itself, so no lease disappears leaving an open record behind.
+      this.sealRecord(lease, 'released')
       this.bump(current)
       this.write(current)
       outcome = { state: 'released', device_id: lease.deviceId, serial: lease.serial }
@@ -616,6 +741,8 @@ export class BenchService {
     }
     this.host.engine.withdrawBench(lease.ticketId, [benchGrantedInputId(lease.id)])
     this.closeRequest(runtime, lease, reason, detail)
+    // A revoked lease seals its record in the same transaction, with the reason the device went to a person.
+    this.sealRecord(lease, END_STATE_OF[reason])
     if (lease.holdId) { try { this.capacity().releaseHold(lease.holdId) } catch { /* No capacity host yet. */ } }
     this.bump(runtime)
     return true
@@ -689,6 +816,102 @@ export class BenchService {
     return retried
   }
 
+  /** How many test records a ticket holds: the quota a grant re-checks inside its own transaction. */
+  recordCount(ticketId: string): number { return this.host.store.keys(`${KV.bench.records.prefix}${ticketId}:`).length }
+  /** The lease a ticket's Worker records against: its active lease, if it holds one. */
+  activeLeaseOf(ticketId: string): BenchLease | undefined {
+    return Object.values(this.runtime().leases).find(lease => lease.ticketId === ticketId && lease.state === 'active')
+  }
+  /** The records of one ticket, newest first. */
+  private recordsOf(ticketId: string): BenchRecord[] {
+    return this.host.store.keys(`${KV.bench.records.prefix}${ticketId}:`)
+      .flatMap(name => { const found = this.host.store.get(name as ReturnType<typeof KV.bench.records>); return found ? [found] : [] })
+  }
+  /**
+   * Append a Worker's facts to the open record of its active lease. The Worker supplies facts only: the host fills the
+   * identities, the times and the derived verdict, refuses writes after a seal, and refuses a payload or record over budget.
+   */
+  record(ticketId: string, assignmentId: string, change: BenchRecordChange): BenchRecord {
+    const lease = Object.values(this.runtime().leases).find(item => item.ticketId === ticketId && item.assignmentId === assignmentId
+      && item.state === 'active')
+    if (!lease) throw new Error('This ticket holds no active bench lease to record against')
+    if (Date.parse(lease.expiresAt) <= this.nowMs()) throw new Error('The lease expired; its record can no longer be written')
+    const payloadBytes = Buffer.byteLength(JSON.stringify(change), 'utf8')
+    if (payloadBytes > RECORD_PAYLOAD_BYTES) throw new Error('the record payload is too large; keep one write under 28 KiB')
+    for (const item of change.cases ?? []) {
+      if (item.outcome !== 'passed' && item.outcome !== 'failed' && item.outcome !== 'insufficient-evidence') {
+        throw new Error('a case outcome is passed, failed or insufficient-evidence')
+      }
+      if (!item.id.trim() || !item.expected.trim() || !item.actual.trim()) {
+        throw new Error('a case needs an id, what it expected and what it saw')
+      }
+    }
+    const record = this.host.store.get(KV.bench.records(ticketId, lease.id))
+    if (!record) throw new Error('This lease has no test record')
+    if (record.state !== 'open') throw new Error('The record of this lease is sealed; a later attempt is a new record')
+    const cases: BenchCase[] = (change.cases ?? []).map(item => ({ id: item.id, expected: item.expected, actual: item.actual,
+      outcome: item.outcome, ...item.note ? { note: item.note } : {} }))
+    if (record.cases.length + cases.length > MAX_CASES) throw new Error(`a record holds at most ${MAX_CASES} cases`)
+    const updated: BenchRecord = { ...record, cases: [...record.cases, ...cases],
+      ...change.installed ? { installed: { ...record.installed, ...change.installed } } : {},
+      ...change.na ? { na: { ...record.na, ...change.na } } : {}, evidence: mergeEvidence(record.evidence, change.evidence),
+      ...change.completedAt ? { completedAt: change.completedAt } : {}, ...change.note ? { note: change.note } : {} }
+    const started = this.observationOf(lease.id)
+    if (started && updated.started === 'unknown') { updated.started = 'reported'; updated.startedAt = started }
+    updated.missing = requiredMissingOf(updated)
+    updated.verdict = verdictOf(updated)
+    if (recordBytes(updated) > RECORD_BYTES) throw new Error('the record would exceed 32 KiB; archive it and start a new batch')
+    this.host.store.set(KV.bench.records(ticketId, lease.id), updated)
+    return updated
+  }
+  /** A ticket's records, newest first, paged by `offset`; each entry is a summary, the full record its own entry. */
+  listRecords(ticketId: string, offset: number, limit = 20): { items: ReturnType<typeof recordSummary>[]; next_offset: number | null } {
+    const records = this.recordsOf(ticketId).sort((a, b) => (b.endedAt ?? b.grantedAt).localeCompare(a.endedAt ?? a.grantedAt))
+    const size = Math.min(limit, 50)
+    return { items: records.slice(offset, offset + size).map(recordSummary),
+      next_offset: records.length > offset + size ? offset + size : null }
+  }
+  /** One record of a ticket; `recordId` is the record's own name, whose last segment is its lease. */
+  readRecord(ticketId: string, recordId: string): BenchRecord | undefined {
+    const direct = this.host.store.get(KV.bench.records(ticketId, recordId.split(':').at(-1) ?? recordId))
+    if (direct?.ticketId === ticketId) return direct
+    return this.recordsOf(ticketId).find(record => record.recordId === recordId || record.leaseId === recordId)
+  }
+  /** The record identity one lease's attempt is stored under. */
+  private recordName(lease: BenchLease): string { return key('bench-record', lease.ticketId, lease.id) }
+  /** Opens the record a grant will fill: the host's identities, the scheduling evidence, and no facts yet. */
+  private openRecord(lease: BenchLease): BenchRecord {
+    const started = this.observationOf(lease.id)
+    return { recordId: this.recordName(lease), ticketId: lease.ticketId, assignmentId: lease.assignmentId, leaseId: lease.id,
+      deviceId: lease.deviceId, serial: lease.serial, batchId: lease.request?.batchId ?? `b-${lease.ticketId}-1`,
+      version: lease.request?.version ?? {}, grantedAt: lease.grantedAt, ...lease.scheduling ? { scheduling: lease.scheduling } : {},
+      state: 'open', started: started ? 'reported' : 'unknown', ...started ? { startedAt: started } : {}, observedAt: this.clock(),
+      cases: [], evidence: {}, missing: [], truncated: false, verdict: 'open' }
+  }
+  /** The time a wrapper call first reported, from the log it appends; the log is evidence, never a security check. */
+  private observationOf(leaseId: string): string | undefined {
+    try {
+      const lines = readFileSync(join(this.host.stateDir, 'bench', 'executions', `${leaseId}.log`), 'utf8').trim().split('\n')
+      const first = lines.find(line => line.trim())
+      const at = first ? (JSON.parse(first) as { at?: string }).at : undefined
+      return typeof at === 'string' ? at : undefined
+    } catch { return undefined }
+  }
+  /** Seals the record of a lease that is ending; a record that never existed or is already sealed is left alone. */
+  private sealRecord(lease: BenchLease, endState: BenchEndState): void {
+    const record = this.host.store.get(KV.bench.records(lease.ticketId, lease.id))
+    if (!record || record.state !== 'open') return
+    record.state = 'sealed'
+    record.endState = endState
+    record.endedAt = this.clock()
+    const started = this.observationOf(lease.id)
+    if (started && record.started === 'unknown') { record.started = 'reported'; record.startedAt = started }
+    record.missing = requiredMissingOf(record)
+    record.verdict = verdictOf(record)
+    trimHostSuffix(record)
+    this.host.store.set(KV.bench.records(lease.ticketId, lease.id), record)
+  }
+
   /** A person confirms a device is free: a `needs-check` or `offline` device goes idle, and the queue continues. */
   clear(deviceId: string): boolean {
     const leases = Object.values(this.runtime().leases).filter(lease => lease.deviceId === deviceId && lease.state !== 'revoked').map(lease => lease.id)
@@ -733,6 +956,8 @@ export class BenchService {
       if (this.prune(runtime)) { this.write(runtime); continue }
       // A request that waited past the promotion threshold is served as urgent from now on.
       if (this.refreshPromotions(runtime)) { this.write(runtime); continue }
+      // A temporary obstacle that a person cleared is no longer a reason to keep the request out of the selection.
+      if (this.refreshProblems(runtime)) { this.write(runtime); continue }
       // A grant whose reservation ran out before its delivery is given back before a new one is made.
       if (this.expireHolds()) continue
       const revision = runtime.revision
@@ -773,7 +998,8 @@ export class BenchService {
   }
   /** Every change that could let another request be served first invalidates a grant selected before it. */
   private candidates(runtime: BenchRuntime, skip: Set<string>): BenchRequest[] {
-    return runtime.queue.filter(request => !request.blocked && this.servable(runtime, request, skip))
+    // A request flagged with a problem is valid but cannot be granted now (a person must act, or the record quota is full).
+    return runtime.queue.filter(request => !request.blocked && !request.problem && this.servable(runtime, request, skip))
       .sort((a, b) => this.compareRequests(runtime, a, b))
   }
   private servable(runtime: BenchRuntime, request: BenchRequest, skip: Set<string>): boolean {
@@ -908,6 +1134,13 @@ export class BenchService {
           return 'dropped'
         }
         if (!benchEligible(ticket, queued.assignmentId)) return 'stale'
+        // The record quota is re-checked here, inside the grant: a check at the entry would let the queue exceed it.
+        if (this.recordCount(ticket.id) >= RECORD_LIMIT) {
+          queued.problem = 'record-quota'
+          this.bump(runtime)
+          this.write(runtime)
+          return 'stale'
+        }
         const record = runtime.devices[device.id]
         if (!record || record.state !== 'idle' || record.serial !== device.serial) return 'failed'
         const at = this.clock()
@@ -921,6 +1154,8 @@ export class BenchService {
         // its order entry stays as a granted placeholder so the positions behind it do not move.
         runtime.queue = runtime.queue.filter(item => item.id !== request.id)
         this.setPhase(runtime, request.id, 'granted')
+        // The open record is written in the same transaction as the lease, so a grant without a record cannot exist.
+        this.host.store.set(KV.bench.records(ticket.id, lease.id), this.openRecord(lease))
         this.bump(runtime)
         this.write(runtime)
         this.host.engine.benchGranted(ticket.id, { id: benchGrantedInputId(lease.id), kind: 'bench-granted', leaseId: lease.id,

@@ -51,3 +51,4 @@ ready means reviewed implementation with relevant checks passed.
 Where this installation leases bench devices, a device is held by a lease: ask for one before touching hardware, and run its commands only through the wrapper the grant names.
 Never start adb or platform-tools yourself, and never add a device or server option: the wrapper runs the granted device, and its refusal is a decision rather than a temporary error.
 Release a device you no longer need before you report, and read the release result: busy means a command is still running, needs-check means the host cannot confirm the device's state.
+Where this installation leases bench devices, record each bench attempt before releasing: its cases, what you installed, where the evidence is and when it completed. An attempt with no record is not a completed test, and the host derives the verdict rather than taking yours.

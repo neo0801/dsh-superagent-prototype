@@ -49,6 +49,8 @@ export interface Api {
 'POST bench/queue/:id/reorder': { body: { operator: string; request_id?: string; before?: boolean; after?: boolean
   queue_version: number; reason: string }; response: { moved: true; position: number; queue_version: number } }
 'POST bench/queue/:id/retry': { body: { operator?: string }; response: { retried: boolean } }
+'GET tickets/:id/records': { query?: { offset?: number; limit?: number }; response: unknown }
+'GET tickets/:id/records/:recordId': { response: unknown }
   'GET prompts': { query?: { revision?: number; offset?: number }; response: PromptsView }
   'PUT prompts': { body: { config: PromptConfig; baseRevision: number }; response: { revision: number; context_delivery: Delivery } }
   'POST prompts/preview': { body: PromptConfig; response: ReturnType<Prompts['preview']> }

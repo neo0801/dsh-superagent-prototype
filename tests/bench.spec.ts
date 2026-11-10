@@ -13,7 +13,8 @@ import { Engine, key, waitsForPerson, type Assessor, type Assignment, type Bench
 import { Store } from '../src/app/store.ts'
 import { KV } from '../src/kv.ts'
 import { benchConfigOf, type BenchConfig, type BenchDevice } from '../src/deployment.ts'
-import { BenchService, benchGrantedInputId, BenchConflict, type BenchCapacity, type BenchHost, type BenchReleaseResult, type BenchRequestResult } from '../src/executor/bench.ts'
+import { BenchService, benchGrantedInputId, BenchConflict, trimHostSuffix, requiredMissingOf, verdictOf,
+  type BenchCapacity, type BenchHost, type BenchRecord, type BenchReleaseResult, type BenchRequestResult } from '../src/executor/bench.ts'
 import { FakeBenchCapacity } from './fixtures/bench-capacity.ts'
 import { WorkerSlots } from '../src/executor/dsh.ts'
 import type { BenchRuntime } from '../src/executor/bench-authorize.ts'
@@ -1195,5 +1196,142 @@ describe('queue order, levels and reordering (S2)', () => {
     expect(runtime.queue.find(item => item.id === requestId('t1', 'a1'))).toMatchObject({ level: 'normal', batchId: 'b-t1-1',
       version: {}, attempts: 0 })
     expect(store.get(KV.bench.runtime)).toMatchObject({ version: 2 })
+  })
+})
+
+describe('traceable test records (S3)', () => {
+  const seedRecord = (store: Store, ticketId: string, leaseId: string, overrides: Partial<BenchRecord> = {}): BenchRecord => {
+    const record: BenchRecord = { recordId: key('bench-record', ticketId, leaseId), ticketId, assignmentId: 'a1', leaseId,
+      deviceId: 'bench-a', serial: 'SERIAL-A', batchId: `${ticketId}-batch`, version: {}, grantedAt: AT, state: 'open',
+      started: 'unknown', observedAt: AT, cases: [], evidence: {}, missing: [], truncated: false, verdict: 'open', ...overrides }
+    store.set(KV.bench.records(ticketId, leaseId), record)
+    return record
+  }
+  const complete = (ticketId: string, leaseId: string, overrides: Partial<BenchRecord> = {}): BenchRecord => ({
+    recordId: key('bench-record', ticketId, leaseId), ticketId, assignmentId: 'a1', leaseId, deviceId: 'bench-a', serial: 'SERIAL-A',
+    batchId: 'b', version: {}, grantedAt: AT, state: 'sealed', started: 'reported', startedAt: AT, observedAt: AT,
+    cases: [{ id: 'c1', expected: 'ok', actual: 'ok', outcome: 'passed' }],
+    installed: { artifact: 'app.apk', config: 'cfg-1', input: 'input-1' }, evidence: { logs: ['bench/l1.txt'] },
+    completedAt: AT, endedAt: AT, endState: 'released', missing: [], truncated: false, verdict: 'passed', ...overrides })
+  const openRecord = (service: BenchService, leaseId: string): BenchRecord => {
+    const record = service.readRecord('t1', leaseId)
+    if (!record) throw new Error('expected a record')
+    return record
+  }
+
+  it('refuses a grant at the record quota without taking the device and keeps the request flagged', async () => {
+    const store = openStore()
+    const { service } = rig(store, { probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    for (let index = 0; index < 199; index++) seedRecord(store, 't1', `old-${index}`)
+    const held = grantedOf(await service.request('t1', 'a1'))
+    expect(service.recordCount('t1')).toBe(200)
+    releasedOf(await service.release('t1', 'a1', { leaseId: held.lease.leaseId }))
+    expect(await service.request('t1', 'a1')).toMatchObject({ state: 'unavailable' })
+    const runtime = service.runtime()
+    expect(runtime.leases).toEqual({})
+    expect(runtime.devices['bench-a']).toMatchObject({ state: 'idle' })
+    expect(runtime.queue[0]).toMatchObject({ problem: 'record-quota' })
+    expect(service.view().queue.map(item => item.problem)).toEqual(['record-quota'])
+  })
+  it('opens the record in the grant transaction and seals it with the release', async () => {
+    const store = openStore()
+    const { service } = rig(store, { probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    const held = grantedOf(await service.request('t1', 'a1', { version: { commit: 'abc123' } }))
+    const opened = openRecord(service, held.lease.leaseId)
+    expect(opened).toMatchObject({ state: 'open', verdict: 'open', ticketId: 't1', assignmentId: 'a1', deviceId: 'bench-a',
+      batchId: 'b-t1-1', version: { commit: 'abc123' }, started: 'unknown' })
+    releasedOf(await service.release('t1', 'a1', { leaseId: held.lease.leaseId }))
+    const sealed = openRecord(service, held.lease.leaseId)
+    expect(sealed).toMatchObject({ state: 'sealed', endState: 'released', verdict: 'insufficient-evidence' })
+    expect(sealed.missing).toEqual(expect.arrayContaining(['installed.artifact', 'evidence', 'cases']))
+    expect(sealed.endedAt).toBe(clock())
+    // A failed delivery seals with a revoked end state; no completed time makes it interrupted, not a failed test.
+    const second = grantedOf(await service.request('t1', 'a1'))
+    service.deliveryFailed(second.lease.leaseId, 'the grant could not be delivered')
+    expect(openRecord(service, second.lease.leaseId)).toMatchObject({ state: 'sealed', endState: 'revoked', verdict: 'interrupted' })
+  })
+  it('seals a completed record as passed even when the grant ends abnormally', async () => {
+    const store = openStore()
+    const { service } = rig(store, { probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    const held = grantedOf(await service.request('t1', 'a1'))
+    service.record('t1', 'a1', { cases: [{ id: 'c1', expected: 'ok', actual: 'ok', outcome: 'passed' }],
+      installed: { artifact: 'app.apk', config: 'cfg-1', input: 'input-1' }, evidence: { logs: ['bench/l1.txt'] },
+      completedAt: clock() })
+    service.deliveryFailed(held.lease.leaseId, 'the device went offline')
+    expect(openRecord(service, held.lease.leaseId)).toMatchObject({ state: 'sealed', endState: 'revoked', verdict: 'passed' })
+  })
+  it('refuses a worker write before its facts are complete and after the seal', async () => {
+    const store = openStore()
+    const { service } = rig(store, { probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    const held = grantedOf(await service.request('t1', 'a1'))
+    // The host, not the Worker, fills the identities: a write against another Assignment is refused.
+    expect(() => service.record('t1', 'other-assignment', { cases: [] })).toThrow(/no active bench lease/)
+    // A sealed record cannot be appended, even by the lease's own Worker.
+    const record = openRecord(service, held.lease.leaseId)
+    store.set(KV.bench.records('t1', held.lease.leaseId), { ...record, state: 'sealed' })
+    expect(() => service.record('t1', 'a1', { cases: [{ id: 'c1', expected: 'ok', actual: 'ok', outcome: 'passed' }] }))
+      .toThrow(/sealed/)
+    // After a release the lease is gone, so there is nothing to record against.
+    store.set(KV.bench.records('t1', held.lease.leaseId), record)
+    releasedOf(await service.release('t1', 'a1', { leaseId: held.lease.leaseId }))
+    expect(() => service.record('t1', 'a1', { cases: [] })).toThrow(/no active bench lease/)
+  })
+  it('derives the verdict from facts in one place', () => {
+    expect(verdictOf(complete('t1', 'l1', { state: 'open', verdict: 'open' }))).toBe('open')
+    expect(verdictOf(complete('t1', 'l1', { endState: 'revoked', completedAt: undefined, endedAt: AT }))).toBe('interrupted')
+    expect(verdictOf(complete('t1', 'l1', { cases: [{ id: 'c1', expected: 'a', actual: 'b', outcome: 'failed' }] }))).toBe('failed')
+    expect(verdictOf(complete('t1', 'l1', { cases: [{ id: 'c1', expected: 'a', actual: 'b', outcome: 'insufficient-evidence' }] })))
+      .toBe('insufficient-evidence')
+    expect(verdictOf(complete('t1', 'l1', { cases: [] }))).toBe('insufficient-evidence')
+    expect(verdictOf(complete('t1', 'l1', { installed: { artifact: 'app.apk', config: 'c' } }))).toBe('insufficient-evidence')
+    expect(verdictOf(complete('t1', 'l1'))).toBe('passed')
+    // An abnormal end after a completed test is judged by the facts, not by how the lease ended.
+    expect(verdictOf(complete('t1', 'l1', { endState: 'revoked' }))).toBe('passed')
+    expect(requiredMissingOf(complete('t1', 'l1'))).toEqual([])
+  })
+  it('trims the host suffix to its budget instead of refusing the seal', () => {
+    const record = complete('t1', 'l1', { missing: Array.from({ length: 20 }, (_, index) => `missing-${index}-${'x'.repeat(200)}`),
+      scheduling: { level: 'normal', effective: 'urgent', promoted: true, waitedSeconds: 90, position: 1, decidedAt: AT,
+        actorVerified: false, actor: 'zhang'.repeat(50), reason: 'why '.repeat(100),
+        reorder: { operator: 'zhang'.repeat(50), actorVerified: false, reason: 'move '.repeat(100), at: AT, beforeId: 'b'.repeat(500),
+          afterId: 'a'.repeat(500), fromPosition: 1, toPosition: 2 } } })
+    trimHostSuffix(record)
+    expect(record.truncated).toBe(true)
+    const suffix = JSON.stringify({ scheduling: record.scheduling, missing: record.missing, endState: record.endState,
+      endedAt: record.endedAt, verdict: record.verdict, truncated: record.truncated })
+    expect(Buffer.byteLength(suffix, 'utf8')).toBeLessThanOrEqual(4096)
+  })
+  it('refuses an oversized payload and more cases than a record holds', async () => {
+    const store = openStore()
+    const { service } = rig(store, { probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    grantedOf(await service.request('t1', 'a1'))
+    expect(() => service.record('t1', 'a1', { cases: [{ id: 'c1', expected: 'a', actual: 'b'.repeat(29 * 1024),
+      outcome: 'passed' }] })).toThrow(/too large/)
+    const cases = Array.from({ length: 51 }, (_, index) => ({ id: `c${index}`, expected: 'a', actual: 'b', outcome: 'passed' as const }))
+    expect(() => service.record('t1', 'a1', { cases })).toThrow(/at most 50 cases/)
+  })
+  it('lists summaries with a cursor and reads one record by its id', async () => {
+    const store = openStore()
+    const { service } = rig(store, { probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    saveTicket(store, ticket('t2', [assignment('a1')]))
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const held = grantedOf(await service.request('t1', 'a1'))
+      releasedOf(await service.release('t1', 'a1', { leaseId: held.lease.leaseId }))
+    }
+    const first = service.listRecords('t1', 0, 2)
+    expect(first.items).toHaveLength(2)
+    expect(first.next_offset).toBe(2)
+    expect(Object.keys(first.items[0]!).sort()).toEqual(['batchId', 'caseCount', 'endedAt', 'endState', 'leaseId', 'recordId',
+      'started', 'verdict'].sort())
+    const recordId = first.items[0]!.recordId
+    expect(service.readRecord('t1', recordId)).toMatchObject({ ticketId: 't1', state: 'sealed' })
+    // The ticket is part of the lookup, so another ticket never reads this record.
+    expect(service.readRecord('t2', recordId)).toBeUndefined()
   })
 })
