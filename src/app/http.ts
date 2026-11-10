@@ -14,6 +14,7 @@ import { SetupError, type SetupProblem } from '../setup.ts'
 import { UserError, type EngineForPeople, type Ticket } from '../core/index.ts'
 import { accountName, type Deployment, type Machine } from '../deployment.ts'
 import type { DshExecutor } from '../executor/dsh.ts'
+import type { BenchService } from '../executor/bench.ts'
 import type { Health } from '../sources/host.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
 import type { Sessions } from './sessions.ts'
@@ -38,6 +39,8 @@ export interface HttpHost {
   readonly settings: Pick<Settings, 'view' | 'save' | 'pause' | 'sync' | 'refreshLabels'>
   readonly engine: EngineForPeople
   readonly executor: Pick<DshExecutor, 'activeCount'>
+  /** The bench devices this installation leases, which only an operator confirms as free; absent when none is configured. */
+  readonly bench?: Pick<BenchService, 'view' | 'clear'>
   readonly health: Record<string, Health>
   readonly machine: Machine
   readonly masterId: string
@@ -204,6 +207,9 @@ function routes(runtime: HttpHost): Routes {
     'POST policy-sync/:id': async ({ params }) => ({ policy: await runtime.settings.sync(params.id) }),
     'POST setup/check': () => { runtime.checkSetup(); return { restarting: true } },
     'GET models': () => runtime.models(),
+    // The bench devices an operator may confirm free after a failed probe, an expiry or a restart that left a lease behind.
+    'GET bench': () => runtime.bench?.view() ?? { devices: [], queue: [] },
+    'POST bench/:id/clear': ({ params }) => ({ cleared: runtime.bench?.clear(decoded(params.id)) ?? false }),
     'GET prompts': ({ query }) => { const { revision, offset } = PromptsQuery.parse(query); return promptsView(runtime, revision, offset) },
     'PUT prompts': async input => {
       const request = z.object({ config: z.unknown(), baseRevision: z.number().int().nonnegative() }).parse(await promptBody(input))

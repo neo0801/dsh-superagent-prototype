@@ -24,6 +24,13 @@ afterEach(async () => { await host?.stop(); host = undefined })
 /** The bench skill each Session registered, by name, as the fixture recorded it. */
 const benchSkills = (sessionId: string) => (host!.skills.get(sessionId) ?? [])
   .filter(skill => skill.name === 'dsh-superagent-bench')
+/** A ledger from an earlier process: the device was leased to a ticket that is gone, so recovery keeps it for a person. */
+const seedRecoveredLease = (store: Store) => store.set(KV.bench.runtime, { version: 1,
+  devices: { 'bench-a': { state: 'busy', serial: 'serial-a', leaseId: 'old-lease' } }, queue: [],
+  leases: { 'old-lease': { id: 'old-lease', token: 'old-token', requestId: 'old-request', ticketId: 'gone-ticket',
+    assignmentId: 'old-assignment', deviceId: 'bench-a', serial: 'serial-a', actions: ['shell'],
+    grantedAt: '2026-11-09T00:00:00.000Z', expiresAt: '2026-11-09T23:59:59.000Z', state: 'active' } },
+  retired: {} } as unknown as BenchRuntime)
 
 it('gives the lease tools and the skill to a worker only', async () => {
   host = await startRuntime(undefined, { bench })
@@ -49,6 +56,9 @@ it('leaves bench out entirely when the configuration names no device', async () 
   expect(host.runtime.bench).toBeUndefined()
   // No wrapper and no call registry: a Worker has no command to reach a device this installation does not lease.
   expect(existsSync(join(host.directory, 'bench'))).toBe(false)
+  // The management route still answers, with nothing to show and nothing to confirm.
+  expect((await host.api('GET', 'bench')).body).toEqual({ devices: [], queue: [] })
+  expect((await host.api('POST', 'bench/bench-a/clear')).body).toEqual({ cleared: false })
 })
 
 it('registers a team skill named bench instead of the packaged one', async () => {
@@ -62,14 +72,7 @@ it('registers a team skill named bench instead of the packaged one', async () =>
 })
 
 it('returns a queued request without a device, a lease or the worker slot', async () => {
-  /** A ledger from an earlier process: the device was leased to a ticket that is gone. */
-  const seed = (store: Store) => store.set(KV.bench.runtime, { version: 1,
-    devices: { 'bench-a': { state: 'busy', serial: 'serial-a', leaseId: 'old-lease' } }, queue: [],
-    leases: { 'old-lease': { id: 'old-lease', token: 'old-token', requestId: 'old-request', ticketId: 'gone-ticket',
-      assignmentId: 'old-assignment', deviceId: 'bench-a', serial: 'serial-a', actions: ['shell'],
-      grantedAt: '2026-11-09T00:00:00.000Z', expiresAt: '2026-11-09T23:59:59.000Z', state: 'active' } },
-    retired: {} } as unknown as BenchRuntime)
-  host = await startRuntime(seed, { bench })
+  host = await startRuntime(seedRecoveredLease, { bench })
   const { sessionId } = await host.acceptedTicket(feishu('1', '@bot 修一下回归'))
   expect(host.runtime.executor.activeCount()).toBe(1)
   const result = await Promise.race([
@@ -88,4 +91,16 @@ it('returns a queued request without a device, a lease or the worker slot', asyn
   host.agents.get(sessionId)!.status = 'idle'
   await host.runtime.idle()
   expect(host.runtime.executor.activeCount()).toBe(0)
+})
+
+it('shows the devices to an operator, who can confirm one as free through the management route', async () => {
+  host = await startRuntime(seedRecoveredLease, { bench })
+  const view = await host.api('GET', 'bench')
+  expect(view.status).toBe(200)
+  expect(view.body).toMatchObject({ devices: [{ id: 'bench-a', serial: 'serial-a', state: 'needs-check' }], queue: [] })
+  // A person confirms the device free; the management route is the only operation a Worker has no access to.
+  expect((await host.api('POST', 'bench/bench-a/clear')).body).toEqual({ cleared: true })
+  expect((await host.api('GET', 'bench')).body).toMatchObject({ devices: [{ id: 'bench-a', state: 'idle' }] })
+  // Only a device a person may confirm is cleared; an idle one is not.
+  expect((await host.api('POST', 'bench/bench-a/clear')).body).toEqual({ cleared: false })
 })
