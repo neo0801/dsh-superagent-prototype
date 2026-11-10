@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Engine, key, waitsForPerson, type Assessor, type Assignment, type BenchGrantedInput, type Executor, type Outbox, type Policy,
   type SourceScope, type Ticket, type TicketInput } from '../src/core/index.ts'
 import { Store } from '../src/app/store.ts'
+import { KV } from '../src/kv.ts'
 import { benchConfigOf, type BenchConfig, type BenchDevice } from '../src/deployment.ts'
 import { BenchService, benchGrantedInputId, type BenchHost, type BenchReleaseResult, type BenchRequestResult } from '../src/executor/bench.ts'
 
@@ -69,17 +70,25 @@ interface RigOptions {
   probe?: BenchHost['probe']
   background?: BenchHost['background']
   lifetime?: AbortSignal
+  /** The gap before a failed allocation is tried again, shortened so a test need not wait a second. */
+  retryMs?: number
+  /** How many grant writes fail first, to exercise the bounded retry of an allocation pass that rolled back. */
+  failGrants?: number
   /** Whether the service records the configured devices at construction, as the runtime does on startup. */
   recover?: boolean
 }
 /** A `BenchService` over `store`, with the real Engine writing the ledger's grants and withdrawals and the clock injected. */
 function rig(store: Store, options: RigOptions = {}): Rig {
   const granted: BenchGrantedInput[] = [], withdrawn: string[] = []
+  let failing = options.failGrants ?? 0
   const engine = new Engine({ repo: store, scope, policy: () => policy, assessor, executor, outbox, now: clock })
   const host: BenchHost = {
     store,
     engine: {
-      benchGranted: (ticketId, input) => { granted.push(input); engine.benchGranted(ticketId, input) },
+      benchGranted: (ticketId, input) => {
+        if (failing > 0) { failing--; throw new Error('the store refused the grant') }
+        granted.push(input); engine.benchGranted(ticketId, input)
+      },
       withdrawBench: (ticketId, inputIds) => { withdrawn.push(...inputIds); engine.withdrawBench(ticketId, inputIds) },
     },
     config: deviceConfig(options.devices ?? [device('bench-a', 'SERIAL-A')], options.config),
@@ -91,6 +100,7 @@ function rig(store: Store, options: RigOptions = {}): Rig {
     background: options.background ?? (async () => []),
     now: clock,
     ...options.probe ? { probe: options.probe } : {},
+    ...options.retryMs === undefined ? {} : { retryMs: options.retryMs },
   }
   const service = new BenchService(host)
   // The runtime records the configured device ledger before any request, so a device must exist as idle first.
@@ -297,14 +307,36 @@ describe('allocation and the queue (B3, B4)', () => {
     advance(1000)
     expect(await service.request('t3', 'a3')).toMatchObject({ state: 'queued' })
     expect(service.runtime().queue.map(item => item.ticketId)).toEqual(['t2', 't3'])
-    // The earlier request no longer qualifies: the device does not stay held by it.
+    // The earlier request no longer qualifies, and the pass that drops it carries on to the request behind it.
     saveTicket(store, { ...recorded(store.tickets.get('t2')), ended: { at: clock(), by: 'executor', outcome: 'dropped' } })
     releasedOf(await service.release('t1', 'a1', { leaseId: held.lease.leaseId }))
     await service.pump()
-    expect(service.runtime().queue.map(item => item.ticketId)).toEqual(['t3'])
-    await service.pump()
-    expect(service.runtime()).toMatchObject({ queue: [] })
+    expect(service.runtime().queue).toEqual([])
     expect(recorded(store.tickets.get('t3')).undelivered).toHaveLength(1)
+  })
+  it('serves a request behind the queue head when its own device is idle', async () => {
+    const store = openStore()
+    // A camera bench that is busy, and a CAN bench that is idle: the camera request must not hold the CAN request.
+    const { service } = rig(store, { devices: [device('bench-camera', 'SERIAL-CAM', { capabilities: ['camera'] }),
+      device('bench-can', 'SERIAL-CAN', { capabilities: ['can'] })], probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    saveTicket(store, ticket('t2', [assignment('a2')]))
+    saveTicket(store, ticket('t4', [assignment('a4')]))
+    saveTicket(store, ticket('t3', [assignment('a3')]))
+    const camera = grantedOf(await service.request('t1', 'a1', { capabilities: ['camera'] }))
+    advance(1000)
+    expect(await service.request('t2', 'a2', { capabilities: ['camera'] })).toMatchObject({ state: 'queued' })
+    advance(1000)
+    expect(await service.request('t4', 'a4', { capabilities: ['camera'] })).toMatchObject({ state: 'queued' })
+    const can = grantedOf(await service.request('t3', 'a3', { capabilities: ['can'] }))
+    expect(can.lease.deviceId).toBe('bench-can')
+    // FIFO still decides between requests that want the same device: t2 waits first, and t4 does not overtake it.
+    expect(service.runtime().queue.map(item => item.ticketId)).toEqual(['t2', 't4'])
+    releasedOf(await service.release('t1', 'a1', { leaseId: camera.lease.leaseId }))
+    await service.pump()
+    const held2 = grantedOf(await service.request('t2', 'a2', { capabilities: ['camera'] }))
+    expect(held2.lease.deviceId).toBe('bench-camera')
+    expect(service.runtime().queue.map(item => item.ticketId)).toEqual(['t4'])
   })
 })
 
@@ -595,11 +627,13 @@ describe('restart recovery (B14)', () => {
 describe('racing probes (B15)', () => {
   it('does not create a lease from a probe that resolves after the ticket ended', async () => {
     const store = openStore()
+    const probed = Promise.withResolvers<void>()
     let resolveProbe!: (state: 'device' | 'offline') => void
-    const probe = vi.fn(() => new Promise<'device' | 'offline'>(resolve => { resolveProbe = resolve }))
+    const probe = vi.fn(() => { probed.resolve(); return new Promise<'device' | 'offline'>(resolve => { resolveProbe = resolve }) })
     const { service } = rig(store, { probe })
     saveTicket(store, ticket('t1', [assignment('a1')]))
     const pending = service.request('t1', 'a1')
+    await probed.promise
     expect(probe).toHaveBeenCalledOnce()
     saveTicket(store, { ...recorded(store.tickets.get('t1')), ended: { at: clock(), by: 'executor', outcome: 'stopped' } })
     resolveProbe('device')
@@ -611,16 +645,54 @@ describe('racing probes (B15)', () => {
   })
   it('does not create a lease from a probe that resolves after the Assignment changed', async () => {
     const store = openStore()
+    const probed = Promise.withResolvers<void>()
     let resolveProbe!: (state: 'device' | 'offline') => void
-    const probe = vi.fn(() => new Promise<'device' | 'offline'>(resolve => { resolveProbe = resolve }))
+    const probe = vi.fn(() => { probed.resolve(); return new Promise<'device' | 'offline'>(resolve => { resolveProbe = resolve }) })
     const { service } = rig(store, { probe })
     saveTicket(store, ticket('t1', [assignment('a1')]))
     const pending = service.request('t1', 'a1')
+    await probed.promise
     saveTicket(store, ticket('t1', [assignment('a1', { state: 'ended' }), assignment('a2')]))
     resolveProbe('device')
     expect((await pending).state).toBe('unavailable')
     expect(service.runtime().leases).toEqual({})
     expect(service.runtime().devices['bench-a']).toMatchObject({ state: 'idle' })
+  })
+})
+
+describe('allocation passes (B4, B12)', () => {
+  it('serves a request a previous process left queued, once recovery records the devices', async () => {
+    const store = openStore()
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    store.set(KV.bench.runtime, { version: 1, devices: {}, queue: [{ id: key('bench-request', 't1', 'a1'), ticketId: 't1',
+      assignmentId: 'a1', capabilities: [], readyAt: AT }], leases: {}, retired: {} })
+    const probe = vi.fn(async () => 'device' as const)
+    const { service } = rig(store, { probe })
+    await service.pump()
+    expect(probe).toHaveBeenCalled()
+    expect(service.runtime().queue).toEqual([])
+    expect(recorded(store.tickets.get('t1')).undelivered).toHaveLength(1)
+  })
+  it('retries a grant that rolled back, without waiting for another request', async () => {
+    const store = openStore()
+    const { service } = rig(store, { probe: async () => 'device', retryMs: 5, failGrants: 1 })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    expect(await service.request('t1', 'a1')).toMatchObject({ state: 'queued' })
+    for (let attempt = 0; attempt < 100 && recorded(store.tickets.get('t1')!).undelivered.length === 0; attempt++) await sleep(5)
+    expect(recorded(store.tickets.get('t1')).undelivered).toHaveLength(1)
+    expect(service.runtime().queue).toEqual([])
+  })
+  it('stops retrying after a bounded number of failed passes', async () => {
+    const store = openStore()
+    const probe = vi.fn(async () => 'device' as const)
+    const { service } = rig(store, { probe, retryMs: 5, failGrants: 100 })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    expect(await service.request('t1', 'a1')).toMatchObject({ state: 'queued' })
+    await sleep(150)
+    // One pass of the request itself, then at most five retries; the request stays queued for its worker's next attempt.
+    expect(probe.mock.calls.length).toBeGreaterThan(0)
+    expect(probe.mock.calls.length).toBeLessThanOrEqual(6)
+    expect(service.runtime().queue).toHaveLength(1)
   })
 })
 

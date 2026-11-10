@@ -23,8 +23,10 @@ import { adbEnvironment, forgetBenchCalls, pendingBenchCalls, probeAdb, type Ben
 const RELEASE_WAIT_MS = 2_000, RELEASE_POLL_MS = 50
 /** How long one `adb get-state` may take before the device counts as offline. */
 const PROBE_TIMEOUT_MS = 5_000
-/** Rounds of one allocation pass: each grants one request or ends the pass, so this only bounds pathological churn. */
+/** Rounds of one allocation pass: each grants what it can, so this only bounds pathological churn. */
 const PUMP_ROUNDS = 32
+/** A grant that rolled back or a probe that failed is tried again, a bounded number of times, without a new request. */
+const PUMP_RETRY_MS = 1_000, PUMP_RETRY_ATTEMPTS = 5
 /**
  * Thrown when a `bench-granted` Input stopped being deliverable while the Session was resolving: its lease was released,
  * revoked or expired, or the ticket changed. The Input is withdrawn, not recorded as a failed delivery.
@@ -47,6 +49,8 @@ export interface BenchHost {
   probe?(serial: string, signal: AbortSignal): Promise<'device' | 'offline'>
   spawn?: BenchSpawn
   now?(): string
+  /** The gap before a failed allocation is tried again; tests shorten it. */
+  retryMs?: number
 }
 
 /** What a granted lease tells its worker: the device, the credential, and one call that needs no editing but the action. */
@@ -77,6 +81,10 @@ export class BenchService {
   /** Leases a release holds: `reconcile` leaves them alone, and their own final commit re-reads what it finds. */
   private readonly releasing = new Set<string>()
   private pumping?: Promise<void>
+  /** A pending retry of an allocation pass whose grant rolled back or whose probe failed. */
+  private retry?: ReturnType<typeof setTimeout>
+  /** Retries since the last external event, which resets them: a bounded effort, not a busy loop. */
+  private attempts = 0
   constructor(private readonly host: BenchHost) {}
 
   /** The ledger as currently stored; a record this version does not read counts as empty, as the wrapper refuses it too. */
@@ -124,6 +132,8 @@ export class BenchService {
       }
       this.write(runtime)
     })
+    // A request an earlier process left queued is served by this one as soon as a device can answer for it.
+    void this.pump()
   }
 
   /** The devices whose state a person may confirm: `needs-check` and `offline`. */
@@ -299,24 +309,67 @@ export class BenchService {
     return true
   }
 
-  /** Allocate the queue in order: a device the head cannot use does not hold it, and a stale probe grants nothing. */
+  /**
+   * Allocate every request the ledger can serve now, in queue order. A request whose devices are all busy or unavailable does
+   * not hold the ones behind it; between requests that want the same device, the earlier one still goes first. An external
+   * event resets the retry count, and a pass that could not place a request although an idle device exists tries again later.
+   */
   async pump(): Promise<void> {
-    return this.pumping ??= this.pumpOnce().finally(() => { this.pumping = undefined })
+    this.cancelRetry()
+    // A pass that began before this call may have read the queue without the request or the free device that prompted it:
+    // wait for it, then pass again, so a caller always sees the effect of its own change.
+    while (this.pumping) await this.pumping
+    // The pass that just ended may have scheduled its own retry; this call supersedes it and starts the count afresh.
+    this.cancelRetry(); this.attempts = 0
+    return this.kick()
+  }
+  /** Start one pass, or join the one running, and arrange the bounded retry a failed pass deserves. */
+  private kick(): Promise<void> {
+    return this.pumping ??= this.pumpOnce().catch(() => { /* A probe or the Store failed; the retry below tries again. */ })
+      .finally(() => { this.pumping = undefined; this.planRetry() })
   }
   private async pumpOnce(): Promise<void> {
     const skip = new Set<string>()
     for (let round = 0; round < PUMP_ROUNDS; round++) {
       if (this.host.lifetime.aborted) return
-      const runtime = this.runtime()
-      const head = this.head(runtime)
-      if (!head) return
-      const device = await this.choose(runtime, head, skip)
-      if (!device) return
-      if (!this.commitGrant(head, device)) skip.add(device.id)
+      const requests = this.queued(this.runtime())
+      if (!requests.length) return
+      let granted = false
+      for (const request of requests) {
+        if (this.host.lifetime.aborted) return
+        const device = await this.choose(this.runtime(), request, skip)
+        if (!device) continue
+        const outcome = this.commitGrant(request, device)
+        if (outcome === 'granted') granted = true
+        // A request that no longer qualifies is gone, so its device stays available for the ones behind it.
+        else if (outcome === 'failed') skip.add(device.id)
+      }
+      if (!granted) return
     }
   }
-  private head(runtime: BenchRuntime): BenchRequest | undefined {
-    return runtime.queue.slice().sort((a, b) => a.readyAt.localeCompare(b.readyAt) || a.id.localeCompare(b.id))[0]
+  private queued(runtime: BenchRuntime): BenchRequest[] {
+    return runtime.queue.slice().sort((a, b) => a.readyAt.localeCompare(b.readyAt) || a.id.localeCompare(b.id))
+  }
+  /** A request still waiting although one of its devices is idle: a grant rollback or a failed probe, not a busy device. */
+  private needsRetry(): boolean {
+    const runtime = this.runtime()
+    return this.queued(runtime).some(request => this.compatible(request.capabilities, request.deviceId)
+      .some(device => runtime.devices[device.id]?.state === 'idle'))
+  }
+  private planRetry(): void {
+    // A pass can end after the host closed its Store, which has nothing left to grant.
+    let waiting: boolean
+    try { waiting = !this.host.lifetime.aborted && this.needsRetry() } catch { return }
+    if (!waiting || this.attempts >= PUMP_RETRY_ATTEMPTS) { this.attempts = 0; return }
+    this.attempts++
+    // One timer at a time: a pass that ends while another retry waits must not leave two chains running.
+    this.cancelRetry()
+    this.retry = setTimeout(() => { this.retry = undefined; void this.kick() }, this.host.retryMs ?? PUMP_RETRY_MS)
+    this.retry.unref?.()
+  }
+  private cancelRetry(): void {
+    if (this.retry === undefined) return
+    clearTimeout(this.retry); this.retry = undefined
   }
   /** The first idle device the request may use whose probe reports `device`; a device that does not goes offline for a person. */
   private async choose(runtime: BenchRuntime, request: BenchRequest, skip: Set<string>): Promise<BenchDevice | undefined> {
@@ -345,19 +398,20 @@ export class BenchService {
   /**
    * Grant the request its device in one transaction: re-read the ledger, the request and the ticket, and only then write the
    * lease, the busy device, and the Input that tells the worker, whose delivery effect is queued in the same transaction.
+   * `dropped` means the request no longer qualified and is gone, so the device stays free for the requests behind it.
    */
-  private commitGrant(request: BenchRequest, device: BenchDevice): boolean {
+  private commitGrant(request: BenchRequest, device: BenchDevice): 'granted' | 'dropped' | 'failed' {
     try {
       return this.host.store.atomic(() => {
         const runtime = this.runtime()
         const queued = runtime.queue.find(item => item.id === request.id)
         const record = runtime.devices[device.id]
-        if (!queued || !record || record.state !== 'idle' || record.serial !== device.serial) return false
+        if (!queued || !record || record.state !== 'idle' || record.serial !== device.serial) return 'failed'
         const ticket = this.host.store.tickets.get(queued.ticketId)
         if (!ticket || !benchEligible(ticket, queued.assignmentId)) {
           runtime.queue = runtime.queue.filter(item => item.id !== request.id)
           this.write(runtime)
-          return false
+          return 'dropped'
         }
         const at = this.clock()
         const lease: BenchLease = { id: randomBytes(12).toString('hex'), token: randomBytes(24).toString('hex'), requestId: queued.id,
@@ -370,11 +424,11 @@ export class BenchService {
         this.host.engine.benchGranted(ticket.id, { id: benchGrantedInputId(lease.id), kind: 'bench-granted', leaseId: lease.id,
           requestId: lease.requestId, deviceId: lease.deviceId, serial: lease.serial, token: lease.token, expiresAt: lease.expiresAt,
           assignmentId: lease.assignmentId, wrapper: this.host.wrapper, at })
-        return true
+        return 'granted'
       })
     } catch {
       // The grant rolled back whole; the request stays queued for the next pass, or goes when its ticket no longer qualifies.
-      return false
+      return 'failed'
     }
   }
   /** Wait, for a bounded time, until no wrapper call of `leaseId` is registered; false when one cannot be confirmed ended. */
