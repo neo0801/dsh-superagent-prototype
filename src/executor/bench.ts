@@ -15,7 +15,8 @@ import type { EngineForBench } from '../core/engine.ts'
 import { key } from '../core/ids.ts'
 import { KV } from '../kv.ts'
 import type { BenchConfig, BenchDevice } from '../deployment.ts'
-import { benchEligible, benchRefusal, emptyBenchRuntime, type BenchLease, type BenchRequest, type BenchRuntime, type DeviceState }
+import { benchEligible, benchRefusal, emptyBenchRuntime, type BenchAuditEntry, type BenchLease, type BenchLevel,
+  type BenchOrderItem, type BenchRequest, type BenchRuntime, type BenchScheduling, type BenchVersion, type DeviceState }
   from './bench-authorize.ts'
 import { adbEnvironment, forgetBenchCalls, pendingBenchCalls, probeAdb, type BenchSpawn } from './bench-adb.ts'
 
@@ -84,10 +85,23 @@ export type BenchReleaseResult = { state: 'released'; device_id: string; serial:
   | { state: 'needs-check'; device_id: string; reason: string }
   | { state: 'not-held'; device_id?: string; device_state?: DeviceState }
   | { state: 'cancelled' }
-/** One device a worker's release left to a person's confirmation. */
-export interface BenchDeviceView { id: string; serial: string; state: DeviceState; lease_id?: string; ticket_id?: string; expires_at?: string; note?: string }export interface BenchView { devices: BenchDeviceView[]; queue: { request_id: string; ticket_id: string; device_id?: string; ready_at: string
+/** One device as `GET bench` reports it: its state, the lease it serves, and what it offers. */
+export interface BenchDeviceView { id: string; serial: string; state: DeviceState; capabilities: string[]; actions: string[]
+  maintainer?: string; lease_id?: string; ticket_id?: string; expires_at?: string; note?: string }
+/** One waiting request as `GET bench` reports it: its evidence, its place, and why it is not granted now. */
+export interface BenchQueueView { request_id: string; ticket_id: string; device_id?: string; level: BenchLevel; effective_level: BenchLevel
+  promoted: boolean; batch_id: string; batch_label?: string; version: BenchVersion; ready_at: string; waited_seconds: number
+  /** The waiting position among requests that are neither granted nor blocked; 1 is the front. */
+  position: number; attempts: number; urgent_hint?: string
   /** Why the host cannot grant it now although it is still valid, such as the ticket waiting for a person. */
-  problem?: string }[] }
+  problem?: string }
+export interface BenchView { devices: BenchDeviceView[]; queue: BenchQueueView[]
+  /** The ledger version a management call must name to change the order it saw. */
+  queue_version: number }
+/** Thrown when a queue move names a stale version: the caller decided against an order that has since changed. */
+export class BenchConflict extends Error {
+  constructor(readonly queueVersion: number) { super('the queue changed since this change was decided; read the queue again') }
+}
 
 const sleep = (ms: number): Promise<void> => new Promise(resolve => { setTimeout(resolve, ms).unref?.() })
 
@@ -130,14 +144,37 @@ export class BenchService {
   private attempts = 0
   constructor(private readonly host: BenchHost) {}
 
-  /** The ledger as currently stored; a record this version does not read counts as empty, as the wrapper refuses it too. */
+  /** The ledger as currently stored, upgraded in memory when an earlier version wrote it; the wrapper reads either version. */
   runtime(): BenchRuntime {
-    const stored = this.host.store.get(KV.bench.runtime)
-    const runtime = stored?.version === 1 ? stored : emptyBenchRuntime()
-    // Records written before a field existed read with its default, so an upgrade keeps queued requests and leases.
+    return this.normalize(this.host.store.get(KV.bench.runtime) as BenchRuntime | undefined)
+  }
+  /**
+   * Reads a stored ledger of either version: a version-1 record keeps its requests and leases and gains the fields a version-2
+   * record needs, with a queue order derived from each request's ready time. Nothing is written here; `recover()` persists it.
+   */
+  private normalize(stored: BenchRuntime | undefined): BenchRuntime {
+    const version = (stored as { version?: number } | undefined)?.version
+    if (!stored || (version !== 1 && version !== 2)) return emptyBenchRuntime()
+    const runtime = stored as BenchRuntime
+    if (version === 1) {
+      const sorted = [...runtime.queue].sort((a, b) => a.readyAt.localeCompare(b.readyAt) || a.id.localeCompare(b.id))
+      Object.assign(runtime, { version: 2, order: sorted.map(item => ({ requestId: item.id,
+        phase: item.blocked ? 'blocked' as const : 'queued' as const })), audit: [], batchCount: {}, revision: 0 })
+    }
     runtime.revision ??= 0
-    for (const request of runtime.queue) request.attempts ??= 0
+    runtime.audit ??= []
+    runtime.order ??= []
+    runtime.batchCount ??= {}
+    for (const request of runtime.queue) this.defaultsOf(request)
+    for (const lease of Object.values(runtime.leases)) if (lease.request) this.defaultsOf(lease.request)
     return runtime
+  }
+  /** Fills the fields a request written before this version existed lacks. */
+  private defaultsOf(request: BenchRequest): void {
+    request.attempts ??= 0
+    request.level ??= 'normal'
+    request.batchId ??= `b-${request.ticketId}-1`
+    request.version ??= {}
   }
   private write(runtime: BenchRuntime): void { this.host.store.set(KV.bench.runtime, runtime) }
   private clock(): string { return this.host.now?.() ?? new Date().toISOString() }
@@ -148,6 +185,99 @@ export class BenchService {
   private bump(runtime: BenchRuntime): void { runtime.revision = (runtime.revision ?? 0) + 1 }
   private mutate<T>(work: (runtime: BenchRuntime) => T): T {
     return this.host.store.atomic(() => { const runtime = this.runtime(); const value = work(runtime); this.write(runtime); return value })
+  }
+  /** The ledger version a management call must name to change the order it saw. */
+  queueVersion(): number { return this.runtime().revision }
+  /**
+   * The operator a management change declares. The name is checked against `bench.operators` when that list exists, but it is
+   * still a declaration: this host has no verified identity for a management call (requirement A-12 is not implemented).
+   */
+  private operatorOf(operator: string | undefined): string {
+    const name = (operator ?? '').trim()
+    if (!name) throw new Error('a management change needs the operator\'s name')
+    if (name.length > 120) throw new Error('the operator name is too long')
+    const allowed = this.host.config.operators
+    if (allowed && !allowed.includes(name)) throw new Error(`${name} is not a configured bench operator`)
+    return name
+  }
+  private waitedSeconds(request: BenchRequest): number {
+    return Math.max(0, Math.floor((this.nowMs() - Date.parse(request.readyAt)) / 1000))
+  }
+  /** Urgent when a person said so, or when the request waited past the promotion threshold; promotion never moves its order. */
+  private effectiveLevel(request: BenchRequest): BenchLevel {
+    if (request.level === 'urgent' || request.promotedAt) return 'urgent'
+    const threshold = this.host.config.promoteAfterSeconds
+    return threshold && this.waitedSeconds(request) >= threshold ? 'urgent' : 'normal'
+  }
+  private orderIndex(runtime: BenchRuntime, requestId: string): number {
+    const at = runtime.order.findIndex(item => item.requestId === requestId)
+    return at < 0 ? runtime.order.length : at
+  }
+  /** Serves urgent requests first, then keeps the order the host recorded; the order index is the only tie-breaker. */
+  private compareRequests(runtime: BenchRuntime, a: BenchRequest, b: BenchRequest): number {
+    const byLevel = this.effectiveLevel(b).localeCompare(this.effectiveLevel(a))
+    return byLevel !== 0 ? byLevel : this.orderIndex(runtime, a.id) - this.orderIndex(runtime, b.id)
+  }
+  /** The requests that are actually waiting for a device, in serving order; granted and blocked requests hold no position. */
+  private waitingOf(runtime: BenchRuntime): BenchRequest[] {
+    return runtime.queue.filter(item => !item.blocked).sort((a, b) => this.compareRequests(runtime, a, b))
+  }
+  private waitingPosition(runtime: BenchRuntime, requestId: string): number {
+    return this.waitingOf(runtime).findIndex(item => item.id === requestId) + 1
+  }
+  private setPhase(runtime: BenchRuntime, requestId: string, phase: BenchOrderItem['phase']): void {
+    const item = runtime.order.find(entry => entry.requestId === requestId)
+    if (item) item.phase = phase
+    else runtime.order.push({ requestId, phase })
+  }
+  private dropOrder(runtime: BenchRuntime, requestId: string): void {
+    runtime.order = runtime.order.filter(item => item.requestId !== requestId)
+  }
+  /** Repairs `order` after a restart: one entry per live request, none orphaned, its phase matching the request's state. */
+  private ensureOrder(runtime: BenchRuntime): void {
+    const live = new Map<string, BenchOrderItem['phase']>()
+    for (const request of runtime.queue) live.set(request.id, request.blocked ? 'blocked' : 'queued')
+    for (const lease of Object.values(runtime.leases)) {
+      if (lease.state === 'revoked' || live.has(lease.requestId)) continue
+      if (lease.request) live.set(lease.requestId, 'granted')
+    }
+    const kept = runtime.order.filter(item => live.has(item.requestId))
+    for (const [requestId, phase] of live) if (!kept.some(item => item.requestId === requestId)) kept.push({ requestId, phase })
+    // A phase an earlier process wrote for a request that changed state meanwhile is corrected, not trusted.
+    for (const item of kept) item.phase = live.get(item.requestId)!
+    runtime.order = kept
+  }
+  /** Records each request that waited past the threshold as promoted, once, with an audit entry; the order is untouched. */
+  private refreshPromotions(runtime: BenchRuntime): boolean {
+    const threshold = this.host.config.promoteAfterSeconds
+    if (!threshold) return false
+    let changed = false
+    for (const request of runtime.queue) {
+      if (request.blocked || request.level === 'urgent' || request.promotedAt) continue
+      if (this.waitedSeconds(request) < threshold) continue
+      request.promotedAt = this.clock()
+      this.audit(runtime, { at: request.promotedAt, action: 'promote', requestId: request.id })
+      this.bump(runtime)
+      changed = true
+    }
+    return changed
+  }
+  private audit(runtime: BenchRuntime, entry: BenchAuditEntry): void {
+    runtime.audit.push(entry)
+    if (runtime.audit.length > 200) runtime.audit.splice(0, runtime.audit.length - 200)
+  }
+  /** Whether two requests could be served by one device, the condition for moving one past the other. */
+  private shareDevice(a: BenchRequest, b: BenchRequest): boolean {
+    const first = new Set(this.compatible(a.capabilities, a.deviceId).map(device => device.id))
+    return this.compatible(b.capabilities, b.deviceId).some(device => first.has(device.id))
+  }
+  private schedulingOf(runtime: BenchRuntime, request: BenchRequest): BenchScheduling {
+    const promoted = this.effectiveLevel(request) === 'urgent' && request.level !== 'urgent'
+    return { level: request.level, effective: this.effectiveLevel(request), promoted,
+      ...request.promotedAt ? { promotedAt: request.promotedAt } : {}, waitedSeconds: this.waitedSeconds(request),
+      position: this.waitingPosition(runtime, request.id), decidedAt: this.clock(), actorVerified: false,
+      ...request.levelEvidence ? { actor: request.levelEvidence.by, action: 'level', reason: request.levelEvidence.reason } : {},
+      ...request.reorder ? { reorder: request.reorder } : {} }
   }
 
   /** Record the configured devices and revoke what a previous process leased: nothing outlives a restart but idle devices. */
@@ -182,25 +312,34 @@ export class BenchService {
         record.state = 'needs-check'
         record.note ??= 'a lease outlived the last process; confirm the device is free'
       }
+      // The upgrade and the order repair happen before any grant: every queued request gets one position; orphans go.
+      this.ensureOrder(runtime)
+      this.bump(runtime)
       this.write(runtime)
     })
     // A request an earlier process left queued is served by this one as soon as a device can answer for it.
     void this.pump()
   }
 
-  /** The devices whose state a person may confirm: `needs-check` and `offline`. */
+  /** The devices and the waiting requests, with each request's evidence and place in the queue. */
   view(): BenchView {
     const runtime = this.runtime()
+    const waiting = this.waitingOf(runtime)
     return { devices: this.host.config.devices.map(device => {
       const record = runtime.devices[device.id], lease = record?.leaseId ? runtime.leases[record.leaseId] : undefined
-      return { id: device.id, serial: device.serial, state: record?.state ?? 'idle',
+      return { id: device.id, serial: device.serial, state: record?.state ?? 'idle', capabilities: [...device.capabilities],
+        actions: [...device.actions], ...device.maintainer ? { maintainer: device.maintainer } : {},
         ...lease ? { lease_id: lease.id, ticket_id: lease.ticketId, expires_at: lease.expiresAt } : {},
         ...record?.note ? { note: record.note } : {} }
-    }), queue: runtime.queue.filter(item => !item.blocked).map(item => {
+    }), queue: waiting.map((item, index) => {
       const problem = this.problemOf(item)
-      return { request_id: item.id, ticket_id: item.ticketId,
-        ...item.deviceId ? { device_id: item.deviceId } : {}, ready_at: item.readyAt, ...problem ? { problem } : {} }
-    }) }
+      const effective = this.effectiveLevel(item)
+      return { request_id: item.id, ticket_id: item.ticketId, ...item.deviceId ? { device_id: item.deviceId } : {},
+        level: item.level, effective_level: effective, promoted: effective === 'urgent' && item.level !== 'urgent',
+        batch_id: item.batchId, ...item.batchLabel ? { batch_label: item.batchLabel } : {}, version: item.version,
+        ready_at: item.readyAt, waited_seconds: this.waitedSeconds(item), position: index + 1, attempts: item.attempts,
+        ...item.urgentHint ? { urgent_hint: item.urgentHint } : {}, ...problem ? { problem } : {} }
+    }), queue_version: runtime.revision }
   }
   /** Why a still-valid request cannot be granted now, derived from the ticket rather than stored. */
   private problemOf(request: BenchRequest): string | undefined {
@@ -216,25 +355,36 @@ export class BenchService {
    * Ask for a device: grant one now, or queue the request behind those already waiting. Refuses a ticket that is not live or
    * that waits for a person, and reports `unavailable` when no configured device could ever satisfy it.
    */
-  async request(ticketId: string, assignmentId: string, want: { capabilities?: readonly string[]; device?: string } = {}): Promise<BenchRequestResult> {
+  async request(ticketId: string, assignmentId: string, want: { capabilities?: readonly string[]; device?: string
+    batchLabel?: string; version?: BenchVersion; urgentHint?: string } = {}): Promise<BenchRequestResult> {
     const ticket = this.host.store.tickets.get(ticketId)
     if (!benchEligible(ticket, assignmentId)) throw new Error('This ticket is not running, or waits for a person; no device is granted')
     const requestId = benchRequestId(ticketId, assignmentId)
     const held = this.held(requestId)
     if (held) return { state: 'granted', lease: this.grantInfo(held), request_id: requestId }
-    const existing = this.runtime().queue.find(item => item.id === requestId)
-    if (existing?.blocked) {
+    const queued = this.runtime().queue.find(item => item.id === requestId)
+    if (queued?.blocked) {
       return { state: 'unavailable', reason: 'the request is blocked for a person; retry or cancel it from the bench panel' }
     }
-    if (existing?.problem) return { state: 'unavailable', reason: existing.problem }
+    if (queued?.problem) return { state: 'unavailable', reason: queued.problem }
+    const batchLabel = want.batchLabel?.trim() || undefined
+    if (queued && queued.batchLabel !== batchLabel) {
+      throw new Error('this ticket already waits in a batch with another label; cancel that request or repeat its label')
+    }
     const capabilities = [...new Set((want.capabilities ?? []).map(value => value.trim()).filter(Boolean))]
     const deviceId = want.device?.trim() || undefined
     const compatible = this.compatible(capabilities, deviceId)
     if (!compatible.length) return { state: 'unavailable', reason: this.unavailableReason(capabilities, deviceId) }
     this.mutate(runtime => {
       if (runtime.queue.some(item => item.id === requestId)) return
+      // A batch is the unit a person reasons about: a retest asks again and gets a new one, a retry keeps its own.
+      const batch = (runtime.batchCount[ticketId] ?? 0) + 1
+      runtime.batchCount[ticketId] = batch
       runtime.queue.push({ id: requestId, ticketId, assignmentId, capabilities, ...deviceId ? { deviceId } : {},
-        readyAt: this.clock(), attempts: 0 })
+        readyAt: this.clock(), level: 'normal', batchId: `b-${ticketId}-${batch}`,
+        ...batchLabel ? { batchLabel } : {}, version: want.version ?? {},
+        ...want.urgentHint?.trim() ? { urgentHint: want.urgentHint.trim().slice(0, 500) } : {}, attempts: 0 })
+      this.setPhase(runtime, requestId, 'queued')
       this.bump(runtime)
     })
     await this.pump()
@@ -244,6 +394,76 @@ export class BenchService {
       return { state: 'queued', request_id: requestId, devices: compatible.map(device => device.id).join(', ') }
     }
     return { state: 'unavailable', reason: 'the request was withdrawn before a device was free' }
+  }
+
+  /**
+   * A person raises or lowers a waiting request's level. Only a request that holds no device can change; the change records
+   * its evidence (the operator is a declaration, `actorVerified` is false) and a grant decided before it is re-evaluated.
+   */
+  setLevel(requestId: string, change: { operator: string; level: BenchLevel; reason: string }): { level: BenchLevel
+    effective_level: BenchLevel; queue_version: number } {
+    const operator = this.operatorOf(change.operator)
+    if (change.level !== 'normal' && change.level !== 'urgent') throw new Error('level must be normal or urgent')
+    const reason = (change.reason ?? '').trim()
+    if (!reason) throw new Error('a level change needs a reason')
+    const result = this.mutate(runtime => {
+      const request = runtime.queue.find(item => item.id === requestId)
+      if (!request) throw new Error('This request is not waiting: it holds a device, or it is done')
+      request.level = change.level
+      delete request.promotedAt
+      request.levelEvidence = { level: change.level, by: operator, actorVerified: false, reason, at: this.clock() }
+      this.audit(runtime, { at: this.clock(), action: 'level', requestId, operator, level: change.level, reason })
+      this.bump(runtime)
+      return { level: request.level, effective_level: this.effectiveLevel(request), queue_version: runtime.revision }
+    })
+    void this.pump()
+    return result
+  }
+
+  /**
+   * Move a waiting request before or after another waiting request of the same effective level that shares a device. The
+   * caller names the queue version it decided against, so a move made against a changed queue is refused instead of applied
+   * to a different order. With no target, `before` moves it to the front and `after` to the back.
+   */
+  reorder(requestId: string, change: { operator: string; target?: string; before?: boolean; after?: boolean
+    queueVersion: number; reason: string }): { moved: true; position: number; queue_version: number } {
+    const operator = this.operatorOf(change.operator)
+    const reason = (change.reason ?? '').trim()
+    if (!reason) throw new Error('a queue move needs a reason')
+    if (!!change.before === !!change.after) throw new Error('name before or after to say where the request goes')
+    const side = change.before ? 'before' : 'after'
+    const result = this.mutate(runtime => {
+      if (runtime.revision !== change.queueVersion) throw new BenchConflict(runtime.revision)
+      const request = runtime.queue.find(item => item.id === requestId)
+      if (!request) throw new Error('This request is not waiting: it holds a device, or it is done')
+      if (request.blocked) throw new Error('a blocked request holds no position; retry it first')
+      const target = change.target ? runtime.queue.find(item => item.id === change.target) : undefined
+      if (change.target && !target) throw new Error('the target request is not waiting')
+      if (target?.blocked) throw new Error('a blocked request holds no position')
+      if (target) {
+        if (this.effectiveLevel(target) !== this.effectiveLevel(request)) {
+          throw new Error('requests can only be reordered within one effective level; use the level route to change it')
+        }
+        if (!this.shareDevice(request, target)) throw new Error('these requests share no compatible device, so their order cannot be swapped')
+      }
+      const from = this.waitingPosition(runtime, request.id)
+      const order = runtime.order
+      const index = order.findIndex(item => item.requestId === request.id)
+      if (index < 0) throw new Error('this request has no queue position to move')
+      const [moved] = order.splice(index, 1)
+      const at = target ? order.findIndex(item => item.requestId === target.id) : undefined
+      const insert = target && at !== undefined ? (side === 'before' ? at : at + 1) : (side === 'before' ? 0 : order.length)
+      order.splice(insert, 0, moved!)
+      const to = this.waitingPosition(runtime, request.id)
+      request.reorder = { operator, actorVerified: false, reason, at: this.clock(),
+        ...target && side === 'before' ? { beforeId: target.id } : {}, ...target && side === 'after' ? { afterId: target.id } : {},
+        fromPosition: from, toPosition: to }
+      this.audit(runtime, { at: this.clock(), action: 'reorder', requestId, operator, reason, from, to })
+      this.bump(runtime)
+      return { moved: true as const, position: to, queue_version: runtime.revision }
+    })
+    void this.pump()
+    return result
   }
 
   /**
@@ -309,6 +529,8 @@ export class BenchService {
       delete current.leases[lease.id]
       current.devices[lease.deviceId] = { state: 'idle', serial: device.serial, checkedAt: this.clock() }
       if (lease.holdId) { try { this.capacity().releaseHold(lease.holdId) } catch { /* No capacity host yet. */ } }
+      // A released request is done, so its place in the queue goes with it; a retest asks again as a new batch.
+      this.dropOrder(current, lease.requestId)
       this.bump(current)
       this.write(current)
       outcome = { state: 'released', device_id: lease.deviceId, serial: lease.serial }
@@ -322,6 +544,8 @@ export class BenchService {
       const index = runtime.queue.findIndex(item => item.id === requestId && item.ticketId === ticketId && item.assignmentId === assignmentId)
       if (index < 0) return false
       runtime.queue.splice(index, 1)
+      this.dropOrder(runtime, requestId)
+      this.bump(runtime)
       return true
     })
     if (cancelled) return { state: 'cancelled' }
@@ -398,14 +622,15 @@ export class BenchService {
   }
   /** Keep the request waiting again, or remove it, as the revocation reason says. */
   private closeRequest(runtime: BenchRuntime, lease: BenchLease, reason: BenchRevokeReason, detail?: string): void {
-    if (REMOVES_REQUEST.has(reason)) return
+    if (REMOVES_REQUEST.has(reason)) { this.dropOrder(runtime, lease.requestId); return }
     const snapshot = lease.request
     if (!snapshot) return
     const counted = COUNTS_FAILURE.has(reason)
     const attempts = snapshot.attempts + (counted ? 1 : 0)
-    const restored: BenchRequest = { id: snapshot.id, ticketId: snapshot.ticketId, assignmentId: snapshot.assignmentId,
-      capabilities: [...snapshot.capabilities], ...snapshot.deviceId ? { deviceId: snapshot.deviceId } : {},
-      readyAt: snapshot.readyAt, attempts }
+    // The snapshot carries the level, batch and version evidence the request had when it was granted.
+    const restored: BenchRequest = { ...snapshot, attempts }
+    delete restored.blocked
+    delete restored.problem
     if (reason === 'temporarily-ineligible') restored.problem = detail ?? REVOKE_TEXT[reason]
     if (counted && attempts >= FAILURE_LIMIT) {
       restored.blocked = { reason: detail ?? REVOKE_TEXT[reason], at: this.clock(), attempts }
@@ -413,6 +638,8 @@ export class BenchService {
     const index = runtime.queue.findIndex(item => item.id === restored.id)
     if (index >= 0) runtime.queue[index] = restored
     else runtime.queue.push(restored)
+    // Its order entry returns with it: the same position, unless it is blocked and so holds no waiting place.
+    this.setPhase(runtime, restored.id, restored.blocked ? 'blocked' : 'queued')
   }
 
   /** Revoke leases whose ticket, Assignment or time ran out, keep requests that may still qualify, and carry on. */
@@ -435,6 +662,8 @@ export class BenchService {
       // Only a ticket that ended or changed its Assignment makes a request permanently invalid; one that merely waits for a
       // person keeps its place and says why it cannot be granted.
       if (this.prune(runtime)) changed = true
+      // A request that waited past the promotion threshold is served as urgent from here on, and the fact is recorded once.
+      if (this.refreshPromotions(runtime)) changed = true
       if (changed) this.write(runtime)
     })
     if (changed) void this.pump()
@@ -444,13 +673,15 @@ export class BenchService {
    * A person clears a blocked request's failure budget: it waits again with the same ready time, batch and selection state,
    * and the host stops trying until someone calls this.
    */
-  retry(requestId: string): boolean {
+  retry(requestId: string, operator?: string): boolean {
+    if (operator !== undefined) this.operatorOf(operator)
     const retried = this.mutate(runtime => {
       const request = runtime.queue.find(item => item.id === requestId)
       if (!request?.blocked) return false
       delete request.blocked
       request.attempts = 0
       delete request.problem
+      this.setPhase(runtime, request.id, 'queued')
       this.bump(runtime)
       return true
     })
@@ -500,6 +731,8 @@ export class BenchService {
       const runtime = this.runtime()
       // A request whose ticket ended or changed its Assignment can never be granted again; drop it before selecting.
       if (this.prune(runtime)) { this.write(runtime); continue }
+      // A request that waited past the promotion threshold is served as urgent from now on.
+      if (this.refreshPromotions(runtime)) { this.write(runtime); continue }
       // A grant whose reservation ran out before its delivery is given back before a new one is made.
       if (this.expireHolds()) continue
       const revision = runtime.revision
@@ -533,6 +766,7 @@ export class BenchService {
       return !!ticket && liveTicket(ticket) && runningAssignment(ticket)?.id === item.assignmentId
     })
     if (kept.length === runtime.queue.length) return false
+    for (const item of runtime.queue) if (!kept.includes(item)) this.dropOrder(runtime, item.id)
     runtime.queue = kept
     this.bump(runtime)
     return true
@@ -540,7 +774,7 @@ export class BenchService {
   /** Every change that could let another request be served first invalidates a grant selected before it. */
   private candidates(runtime: BenchRuntime, skip: Set<string>): BenchRequest[] {
     return runtime.queue.filter(request => !request.blocked && this.servable(runtime, request, skip))
-      .sort((a, b) => a.readyAt.localeCompare(b.readyAt) || a.id.localeCompare(b.id))
+      .sort((a, b) => this.compareRequests(runtime, a, b))
   }
   private servable(runtime: BenchRuntime, request: BenchRequest, skip: Set<string>): boolean {
     const ticket = this.host.store.tickets.get(request.ticketId)
@@ -560,7 +794,10 @@ export class BenchService {
       const request = runtime.queue.find(item => item.id === requestId)
       if (!request || request.blocked) return
       request.attempts += 1
-      if (request.attempts >= FAILURE_LIMIT) request.blocked = { reason, at: this.clock(), attempts: request.attempts }
+      if (request.attempts >= FAILURE_LIMIT) {
+        request.blocked = { reason, at: this.clock(), attempts: request.attempts }
+        this.setPhase(runtime, request.id, 'blocked')
+      }
       this.bump(runtime)
     })
   }
@@ -665,6 +902,7 @@ export class BenchService {
         const ticket = this.host.store.tickets.get(queued.ticketId)
         if (!ticket || !liveTicket(ticket) || runningAssignment(ticket)?.id !== queued.assignmentId) {
           runtime.queue = runtime.queue.filter(item => item.id !== request.id)
+          this.dropOrder(runtime, request.id)
           this.bump(runtime)
           this.write(runtime)
           return 'dropped'
@@ -676,11 +914,13 @@ export class BenchService {
         const lease: BenchLease = { id: randomBytes(12).toString('hex'), token: randomBytes(24).toString('hex'), requestId: queued.id,
           ticketId: ticket.id, assignmentId: queued.assignmentId, deviceId: device.id, serial: device.serial, actions: [...device.actions],
           grantedAt: at, expiresAt: new Date(Date.parse(at) + this.host.config.leaseSeconds * 1000).toISOString(), state: 'active',
-          ...holdId ? { holdId } : {}, request: { ...queued } }
+          ...holdId ? { holdId } : {}, request: { ...queued }, scheduling: this.schedulingOf(runtime, queued) }
         runtime.leases[lease.id] = lease
         runtime.devices[device.id] = { state: 'busy', leaseId: lease.id, serial: device.serial, checkedAt: at }
-        // The request leaves the queue while its grant waits for the worker; the lease keeps it to restore on a revoke.
+        // The request leaves the queue while its grant waits for the worker; the lease keeps it to restore on a revoke, and
+        // its order entry stays as a granted placeholder so the positions behind it do not move.
         runtime.queue = runtime.queue.filter(item => item.id !== request.id)
+        this.setPhase(runtime, request.id, 'granted')
         this.bump(runtime)
         this.write(runtime)
         this.host.engine.benchGranted(ticket.id, { id: benchGrantedInputId(lease.id), kind: 'bench-granted', leaseId: lease.id,

@@ -29,9 +29,15 @@ export function benchTools(host: BenchToolsHost, ticket: Ticket): Tool[] {
       schema: z.object({
         capabilities: z.array(z.string().min(1)).max(16).optional().describe('What the work needs, such as android-13 or camera; each must be one the device offers.'),
         device: z.string().min(1).optional().describe('One device id, when the work names the bench it needs.'),
+        batch_label: z.string().min(1).max(120).optional().describe('A short label for this batch of work, shown to a person; a retest uses a new label.'),
+        version: z.object({ commit: z.string().max(120).optional(), artifact: z.string().max(200).optional() }).strict().optional()
+          .describe('The build under test, so a record can say what it ran.'),
+        urgent_hint: z.string().min(1).max(500).optional().describe('Why this work is urgent, for a person to decide; it does not raise the level by itself.'),
       }).strict(),
       execute: async args => {
-        const result = await host.bench.request(ticketId, assignment(), args)
+        const result = await host.bench.request(ticketId, assignment(), { ...args.capabilities ? { capabilities: args.capabilities } : {},
+          ...args.device ? { device: args.device } : {}, ...args.batch_label ? { batchLabel: args.batch_label } : {},
+          ...args.version ? { version: args.version } : {}, ...args.urgent_hint ? { urgentHint: args.urgent_hint } : {} })
         if (result.state === 'granted') {
           return { state: 'granted', request_id: result.request_id, lease_id: result.lease.leaseId, token: result.lease.token,
             device_id: result.lease.deviceId, serial: result.lease.serial, expires_at: result.lease.expiresAt, command: result.lease.command }

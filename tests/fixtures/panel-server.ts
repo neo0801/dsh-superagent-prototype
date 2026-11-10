@@ -372,9 +372,11 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
   'GET models': { answer: () => ({ default: { provider: 'host', model: 'default' }, routableProviders: [], failures: [],
     groups: [{ id: 'worker-provider', name: 'Worker provider', models: [{ id: 'worker-model', name: 'Worker model',
       reasoning: { efforts: [{ id: 'high', name: 'High' }] } }] }] }) },
-  'GET bench': { answer: () => ({ devices: [], queue: [] }) },
+  'GET bench': { answer: () => ({ devices: [], queue: [], queue_version: 0 }) },
   'POST bench/:id/clear': { answer: () => ({ cleared: false }) },
-  'POST bench/queue/:id/retry': { answer: () => ({ retried: false }) },
+  'POST bench/queue/:id/retry': { body: true, answer: () => ({ retried: false }) },
+  'POST bench/queue/:id/level': { body: true, answer: () => ({ level: 'normal' as const, effective_level: 'normal' as const, queue_version: 0 }) },
+  'POST bench/queue/:id/reorder': { body: true, answer: () => ({ moved: true as const, position: 1, queue_version: 0 }) },
   'GET prompts': { query: ['revision', 'offset'], answer: () => server.prompts },
   'PUT prompts': { body: true, answer: ({ body }) => {
     const { revision } = server.prompts

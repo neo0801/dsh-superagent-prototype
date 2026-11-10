@@ -56,8 +56,8 @@ it('leaves bench out entirely when the configuration names no device', async () 
   expect(host.runtime.bench).toBeUndefined()
   // No wrapper and no call registry: a Worker has no command to reach a device this installation does not lease.
   expect(existsSync(join(host.directory, 'bench'))).toBe(false)
-  // The management route still answers, with nothing to show and nothing to confirm.
-  expect((await host.api('GET', 'bench')).body).toEqual({ devices: [], queue: [] })
+  // The management route still answers, with nothing to show, nothing to confirm, and the queue version it decided against.
+  expect((await host.api('GET', 'bench')).body).toEqual({ devices: [], queue: [], queue_version: 0 })
   expect((await host.api('POST', 'bench/bench-a/clear')).body).toEqual({ cleared: false })
 })
 

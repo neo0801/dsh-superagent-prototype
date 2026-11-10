@@ -13,9 +13,10 @@ import { Engine, key, waitsForPerson, type Assessor, type Assignment, type Bench
 import { Store } from '../src/app/store.ts'
 import { KV } from '../src/kv.ts'
 import { benchConfigOf, type BenchConfig, type BenchDevice } from '../src/deployment.ts'
-import { BenchService, benchGrantedInputId, type BenchCapacity, type BenchHost, type BenchReleaseResult, type BenchRequestResult } from '../src/executor/bench.ts'
+import { BenchService, benchGrantedInputId, BenchConflict, type BenchCapacity, type BenchHost, type BenchReleaseResult, type BenchRequestResult } from '../src/executor/bench.ts'
 import { FakeBenchCapacity } from './fixtures/bench-capacity.ts'
 import { WorkerSlots } from '../src/executor/dsh.ts'
+import type { BenchRuntime } from '../src/executor/bench-authorize.ts'
 
 const AT = '2026-11-09T00:00:00.000Z'
 const sleep = (ms: number): Promise<void> => new Promise(resolve => { setTimeout(resolve, ms) })
@@ -69,7 +70,7 @@ interface Rig {
 }
 interface RigOptions {
   devices?: BenchDevice[]
-  config?: Partial<Pick<BenchConfig, 'adb' | 'adbServerSocket' | 'leaseSeconds' | 'holdSeconds'>>
+  config?: Partial<Pick<BenchConfig, 'adb' | 'adbServerSocket' | 'leaseSeconds' | 'holdSeconds' | 'promoteAfterSeconds' | 'operators'>>
   repository?: string | null
   probe?: BenchHost['probe']
   background?: BenchHost['background']
@@ -730,7 +731,7 @@ describe('allocation passes (B4, B12)', () => {
     const store = openStore()
     saveTicket(store, ticket('t1', [assignment('a1')]))
     store.set(KV.bench.runtime, { version: 1, devices: {}, queue: [{ id: key('bench-request', 't1', 'a1'), ticketId: 't1',
-      assignmentId: 'a1', capabilities: [], readyAt: AT, attempts: 0 }], leases: {}, retired: {}, revision: 0 })
+      assignmentId: 'a1', capabilities: [], readyAt: AT, attempts: 0 }], leases: {}, retired: {}, revision: 0 } as unknown as BenchRuntime)
     const probe = vi.fn(async () => 'device' as const)
     const { service } = rig(store, { probe })
     await service.pump()
@@ -829,12 +830,16 @@ describe('clear and view', () => {
     service.revokeForTicket('t3', 'the ticket stopped')
     const view = service.view()
     expect(view.devices).toEqual([
-      { id: 'bench-a', serial: 'SERIAL-A', state: 'offline', note: 'adb -s <serial> get-state did not report device' },
-      { id: 'bench-b', serial: 'SERIAL-B', state: 'busy', lease_id: onB.lease.leaseId, ticket_id: 't2', expires_at: onB.lease.expiresAt },
-      { id: 'bench-c', serial: 'SERIAL-C', state: 'needs-check', note: 'the ticket stopped' },
+      { id: 'bench-a', serial: 'SERIAL-A', state: 'offline', capabilities: ['camera'], actions: ['shell'],
+        note: 'adb -s <serial> get-state did not report device' },
+      { id: 'bench-b', serial: 'SERIAL-B', state: 'busy', capabilities: [], actions: ['shell'], lease_id: onB.lease.leaseId,
+        ticket_id: 't2', expires_at: onB.lease.expiresAt },
+      { id: 'bench-c', serial: 'SERIAL-C', state: 'needs-check', capabilities: [], actions: ['shell'], note: 'the ticket stopped' },
     ])
     expect(onC.lease.leaseId).not.toBe(onB.lease.leaseId)
-    expect(view.queue).toEqual([{ request_id: key('bench-request', 't1', 't1-assignment'), ticket_id: 't1', ready_at: clock() }])
+    expect(view.queue).toEqual([{ request_id: key('bench-request', 't1', 't1-assignment'), ticket_id: 't1', level: 'normal',
+      effective_level: 'normal', promoted: false, batch_id: 'b-t1-1', version: {}, ready_at: clock(), waited_seconds: 0,
+      position: 1, attempts: 0 }])
   })
 })
 
@@ -1016,5 +1021,179 @@ describe('worker slot reservations (S1)', () => {
     expect(service.sweepHolds(Date.parse(AT) + 59_000)).toEqual([])
     expect(service.sweepHolds(Date.parse(AT) + 61_000).map(hold => hold.id)).toEqual([held.id])
     expect(service.used()).toBe(0)
+  })
+})
+
+describe('queue order, levels and reordering (S2)', () => {
+  const requestId = (ticket: string, assignment: string): string => key('bench-request', ticket, assignment)
+  const queued = (service: BenchService): string[] => service.view().queue.map(item => item.ticket_id)
+  const queue = (service: BenchService) => service.view().queue
+  const occupy = async (service: BenchService): Promise<string> => grantedOf(await service.request('holder', 'holder-a')).lease.leaseId
+
+  it('serves an urgent request before earlier normal ones and records who said so', async () => {
+    const store = openStore()
+    const capacity = new FakeBenchCapacity()
+    capacity.free = false
+    const { service } = rig(store, { capacity, probe: async () => 'device' })
+    for (const id of ['t1', 't2', 't3', 't4']) saveTicket(store, ticket(id, [assignment(`${id}-a`)]))
+    for (const id of ['t1', 't2', 't3', 't4']) await service.request(id, `${id}-a`)
+    advance(1_000)
+    service.setLevel(requestId('t4', 't4-a'), { operator: 'zhang', level: 'urgent', reason: 'release blocker' })
+    expect(queued(service)).toEqual(['t4', 't1', 't2', 't3'])
+    expect(queue(service).map(item => item.position)).toEqual([1, 2, 3, 4])
+    expect(queue(service)[0]).toMatchObject({ level: 'urgent', effective_level: 'urgent', promoted: false })
+    // The operator is recorded as a declaration, never a verified identity (requirement A-12 is not implemented).
+    expect(service.runtime().queue.find(item => item.id === requestId('t4', 't4-a'))?.levelEvidence)
+      .toMatchObject({ level: 'urgent', by: 'zhang', actorVerified: false, reason: 'release blocker' })
+  })
+  it('promotes a request that waited past the threshold without moving its place', async () => {
+    const store = openStore()
+    const capacity = new FakeBenchCapacity()
+    capacity.free = false
+    const { service } = rig(store, { capacity, probe: async () => 'device', config: { promoteAfterSeconds: 60 } })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    saveTicket(store, ticket('t2', [assignment('a2')]))
+    await service.request('t1', 'a1')
+    advance(30_000)
+    await service.request('t2', 'a2')
+    advance(31_000)
+    await service.pump()
+    expect(queue(service).map(item => item.ticket_id)).toEqual(['t1', 't2'])
+    expect(queue(service)[0]).toMatchObject({ effective_level: 'urgent', promoted: true, position: 1 })
+    expect(queue(service)[1]).toMatchObject({ effective_level: 'normal', promoted: false, position: 2 })
+    expect(service.runtime().queue.find(item => item.id === requestId('t1', 'a1'))?.promotedAt).toBe(clock())
+    expect(service.runtime().audit.filter(entry => entry.action === 'promote').map(entry => entry.requestId)).toEqual([requestId('t1', 'a1')])
+  })
+  it('moves a waiting request past another and keeps positions consecutive around a granted placeholder', async () => {
+    const store = openStore()
+    const { service } = rig(store, { probe: async () => 'device' })
+    for (const id of ['holder', 't1', 't2', 't3', 't4', 't5']) saveTicket(store, ticket(id, [assignment(`${id}-a`)]))
+    const holderLease = await occupy(service)
+    for (const id of ['t1', 't2', 't3', 't4', 't5']) { advance(1_000); await service.request(id, `${id}-a`) }
+    expect(queued(service)).toEqual(['t1', 't2', 't3', 't4', 't5'])
+    service.reorder(requestId('t1', 't1-a'), { operator: 'zhang', target: requestId('t5', 't5-a'), after: true,
+      queueVersion: service.queueVersion(), reason: 'put the smoke test last' })
+    // The granted holder keeps the first order position but holds no waiting place; the moved request goes behind t5.
+    expect(queued(service)).toEqual(['t2', 't3', 't4', 't5', 't1'])
+    expect(queue(service).map(item => item.position)).toEqual([1, 2, 3, 4, 5])
+    // A revoked grant returns with its original position, so nothing duplicates or disappears.
+    service.deliveryFailed(holderLease, 'the grant could not be delivered')
+    expect(queued(service)).toEqual(['holder', 't2', 't3', 't4', 't5', 't1'])
+    expect(queue(service).map(item => item.position)).toEqual([1, 2, 3, 4, 5, 6])
+  })
+  it('refuses a move decided against a changed queue, a cross-level move and requests sharing no device', async () => {
+    const store = openStore()
+    const capacity = new FakeBenchCapacity()
+    capacity.free = false
+    const { service } = rig(store, { capacity, probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    saveTicket(store, ticket('t2', [assignment('a2')]))
+    await service.request('t1', 'a1')
+    await service.request('t2', 'a2')
+    const stale = service.queueVersion()
+    service.setLevel(requestId('t2', 'a2'), { operator: 'zhang', level: 'urgent', reason: 'blocker' })
+    expect(() => service.reorder(requestId('t1', 'a1'), { operator: 'zhang', target: requestId('t2', 'a2'), after: true,
+      queueVersion: stale, reason: 'move' })).toThrow(BenchConflict)
+    expect(() => service.reorder(requestId('t1', 'a1'), { operator: 'zhang', target: requestId('t2', 'a2'), after: true,
+      queueVersion: service.queueVersion(), reason: 'move' })).toThrow(/one effective level/)
+    // Two devices with nothing in common: their requests cannot swap places.
+    const store2 = openStore()
+    const capacity2 = new FakeBenchCapacity()
+    capacity2.free = false
+    const other = rig(store2, { capacity: capacity2, probe: async () => 'device',
+      devices: [device('bench-a', 'SERIAL-A', { capabilities: ['camera'] }), device('bench-b', 'SERIAL-B')] })
+    saveTicket(store2, ticket('c1', [assignment('c1-a')]))
+    saveTicket(store2, ticket('c2', [assignment('c2-a')]))
+    await other.service.request('c1', 'c1-a', { device: 'bench-a' })
+    await other.service.request('c2', 'c2-a', { device: 'bench-b' })
+    expect(() => other.service.reorder(requestId('c1', 'c1-a'), { operator: 'zhang', target: requestId('c2', 'c2-a'), after: true,
+      queueVersion: other.service.queueVersion(), reason: 'move' })).toThrow(/share no compatible device/)
+  })
+  it('refuses an operator the configuration does not list and records the one it does', async () => {
+    const store = openStore()
+    const capacity = new FakeBenchCapacity()
+    capacity.free = false
+    const { service } = rig(store, { capacity, probe: async () => 'device', config: { operators: ['zhang'] } })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    await service.request('t1', 'a1')
+    expect(() => service.setLevel(requestId('t1', 'a1'), { operator: 'li', level: 'urgent', reason: 'blocker' }))
+      .toThrow(/not a configured bench operator/)
+    expect(service.setLevel(requestId('t1', 'a1'), { operator: 'zhang', level: 'urgent', reason: 'blocker' }))
+      .toMatchObject({ level: 'urgent', effective_level: 'urgent' })
+    expect(service.runtime().queue[0]?.levelEvidence?.actorVerified).toBe(false)
+  })
+  it('keeps one request per Assignment and gives a retest a new batch id', async () => {
+    const store = openStore()
+    const { service } = rig(store, { probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    expect(await service.request('t1', 'a1')).toMatchObject({ state: 'granted' })
+    const held = grantedOf(await service.request('t1', 'a1'))
+    expect(queued(service)).toEqual([])
+    expect(service.runtime().leases[held.lease.leaseId]?.request?.batchId).toBe('b-t1-1')
+    releasedOf(await service.release('t1', 'a1', { leaseId: held.lease.leaseId }))
+    const again = await service.request('t1', 'a1', { batchLabel: 'after the fix' })
+    expect(again).toMatchObject({ state: 'granted' })
+    const batch = Object.values(service.runtime().leases)[0]?.request?.batchId
+    expect(batch).toBe('b-t1-2')
+  })
+  it('keeps the worker\'s urgency hint and build version without promoting the request', async () => {
+    const store = openStore()
+    const capacity = new FakeBenchCapacity()
+    capacity.free = false
+    const { service } = rig(store, { capacity, probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    await service.request('t1', 'a1', { urgentHint: 'blocks the release', version: { commit: 'abc123', artifact: 'build-7' } })
+    expect(queue(service)[0]).toMatchObject({ level: 'normal', effective_level: 'normal', promoted: false,
+      urgent_hint: 'blocks the release', version: { commit: 'abc123', artifact: 'build-7' } })
+  })
+  it('excludes a blocked request from waiting positions until a person retries it', async () => {
+    const store = openStore()
+    const { service } = rig(store, { probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    for (let cycle = 0; cycle < 5; cycle++) {
+      const held = grantedOf(await service.request('t1', 'a1'))
+      service.deliveryFailed(held.lease.leaseId, 'the grant could not be delivered')
+      service.clear('bench-a')
+    }
+    expect(queue(service)).toEqual([])
+    expect(service.runtime().order).toEqual([{ requestId: requestId('t1', 'a1'), phase: 'blocked' }])
+    expect(service.retry(requestId('t1', 'a1'), 'zhang')).toBe(true)
+    expect(queue(service).map(item => item.ticket_id)).toEqual(['t1'])
+    expect(service.view().queue[0]?.position).toBe(1)
+  })
+  it('carries the scheduling evidence into the lease so it outlives the audit', async () => {
+    const store = openStore()
+    const capacity = new FakeBenchCapacity()
+    capacity.free = false
+    const { service } = rig(store, { capacity, probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    await service.request('t1', 'a1')
+    service.setLevel(requestId('t1', 'a1'), { operator: 'zhang', level: 'urgent', reason: 'release blocker' })
+    capacity.free = true
+    await service.pump()
+    const lease = Object.values(service.runtime().leases)[0]!
+    expect(lease.scheduling).toMatchObject({ level: 'urgent', effective: 'urgent', promoted: false, position: 1,
+      actor: 'zhang', actorVerified: false, action: 'level', reason: 'release blocker' })
+    // The audit is capped and evictable; the lease's own evidence is not.
+    const runtime = service.runtime()
+    runtime.audit = []
+    expect(lease.scheduling?.actor).toBe('zhang')
+  })
+  it('upgrades a version-1 ledger keeping its queue order', async () => {
+    const store = openStore()
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    saveTicket(store, ticket('t2', [assignment('a2')]))
+    store.set(KV.bench.runtime, { version: 1, devices: {}, leases: {}, retired: {}, revision: 0,
+      queue: [{ id: requestId('t2', 'a2'), ticketId: 't2', assignmentId: 'a2', capabilities: [], readyAt: '2026-11-09T00:00:10.000Z' },
+        { id: requestId('t1', 'a1'), ticketId: 't1', assignmentId: 'a1', capabilities: [], readyAt: AT }] } as unknown as BenchRuntime)
+    const { service } = rig(store, { probe: async () => 'device', recover: false })
+    service.recover()
+    const runtime = service.runtime()
+    expect(runtime.version).toBe(2)
+    expect(runtime.order.map(item => item.requestId)).toEqual([requestId('t1', 'a1'), requestId('t2', 'a2')])
+    expect(runtime.order.map(item => item.phase)).toEqual(['queued', 'queued'])
+    expect(runtime.queue.find(item => item.id === requestId('t1', 'a1'))).toMatchObject({ level: 'normal', batchId: 'b-t1-1',
+      version: {}, attempts: 0 })
+    expect(store.get(KV.bench.runtime)).toMatchObject({ version: 2 })
   })
 })

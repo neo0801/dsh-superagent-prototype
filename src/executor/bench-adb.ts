@@ -69,7 +69,8 @@ function readSnapshot(stateDir: string, leaseId: string): BenchSnapshot | undefi
     const row = db.prepare('SELECT value FROM kv WHERE key = ?').get(KV.bench.runtime)
     if (row === undefined) return {}
     const runtime = JSON.parse(String(row.value)) as BenchRuntime
-    const lease = runtime?.version === 1 ? runtime.leases?.[leaseId] : undefined
+    const version = (runtime as { version?: number } | undefined)?.version
+  const lease = runtime && (version === 1 || version === 2) ? runtime.leases?.[leaseId] : undefined
     const ticket = lease ? db.prepare('SELECT value FROM ticket WHERE id = ?').get(lease.ticketId) : undefined
     return { runtime, ...ticket === undefined ? {} : { ticket: JSON.parse(String(ticket.value)) as Ticket } }
   } catch { return undefined } finally { try { db?.close() } catch { /* Already closed. */ } }
@@ -132,7 +133,8 @@ export async function runBenchAdb(argv: readonly string[], options: BenchAdbOpti
       closeSync(openSync(callFile, 'wx', 0o600))
     } catch { return refuse('the bench call registry is not writable') }
     const snapshot = readSnapshot(options.stateDir, leaseId)
-    if (!snapshot?.runtime || snapshot.runtime.version !== 1) return refuse('the host bench ledger is unreadable')
+    const version = (snapshot?.runtime as { version?: number } | undefined)?.version
+  if (!snapshot?.runtime || (version !== 1 && version !== 2)) return refuse('the host bench ledger is unreadable')
     const lease = snapshot.runtime.leases?.[leaseId]
     if (!lease) return refuse(`bench call refused: ${BENCH_REFUSALS.lease}`)
     // The action comes from the lease the host granted, never from the caller's own capabilities.

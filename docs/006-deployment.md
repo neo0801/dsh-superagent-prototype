@@ -121,6 +121,7 @@ bench:
   adbServerSocket: tcp:127.0.0.1:5037
   leaseSeconds: 1800
   holdSeconds: 60
+  promoteAfterSeconds: 1800
   devices:
     - id: bench-a
       serial: R58M123456A
@@ -139,6 +140,8 @@ bench:
 - `actions` lists the adb device commands the device may run, such as `shell`, `install`, `push`, `pull` and `logcat`. `am`, `pm` and `getprop` go through `shell`. Server-wide commands, such as `start-server`, `kill-server`, `devices`, `connect` and `pair`, are refused at startup.
 - `leaseSeconds` is between 60 and 86400, defaulting to 1800.
 - `holdSeconds` is between 10 and 600, defaulting to 60: how long a grant may wait for the Worker to start before the host gives the device back.
+- `promoteAfterSeconds` is between 0 and 86400, defaulting to 0 (no promotion): how long a normal request may wait before the host serves it as urgent.
+- `operators` is an optional list of declared names allowed to change levels or order; without it any declared name is accepted. The name is a declaration, not a verified identity.
 - The block is read once at start, so a change needs a restart.
 
 At start, a configured installation writes `<stateDir>/bench/bench-adb.mjs`, the wrapper through which Workers reach a leased device, and creates `<stateDir>/bench/calls/`, where a running call registers itself. The leases and the waiting requests live in the database under the `bench:runtime` key, so back up `orchestrator.sqlite` with the state directory. A device a restart or a release left `needs-check`, or a probe left `offline`, serves no Worker until a person confirms it free with `POST bench/<device id>/clear`; `GET bench` shows each device's state and the requests waiting. [003 Execution](003-execution.md) describes what a Worker gets and how it gives the device back.
@@ -230,8 +233,11 @@ Agents may rely on these routes and fields. The other routes in `src/app/api.ts`
 | `POST policy-sync/<source id>` | Syncs that Source's allowed list now: `policy`, the Source's part as saved |
 | `GET prompts`, `PUT prompts` with `{"config", "baseRevision"}` | Reads the prompt configuration: `current`, with its `revision` and `config`, `defaults`, `sections`, the team sections in the order Sessions read them, `skillName`, the pattern of a team skill's name, `builtin`, the names a team skill cannot take, and `skillPrefix`, which Sessions load a skill's name under. Or saves it: the new `revision` |
 | `POST tickets/<id>/retry`, `POST tickets/<id>/stop` | Retries or stops a Ticket, as the panel does |
-| `GET bench` | The bench devices, each with `id`, `serial`, `state` (`idle`, `busy`, `needs-check` or `offline`), the `lease_id`, `ticket_id` and `expires_at` it serves, and its `note` when it waits for a person; and `queue`, the requests still waiting in order, each with `request_id`, `ticket_id`, `device_id` when it named one, and `ready_at`. Both empty on an installation that names no device |
+| `GET bench` | The bench devices and the waiting requests, plus `queue_version`, the value a change below must name. A device carries `id`, `serial`, `state` (`idle`, `busy`, `needs-check` or `offline`), `capabilities`, `actions`, `maintainer`, the `lease_id`, `ticket_id` and `expires_at` it serves, and its `note` when it waits for a person. A waiting request carries `request_id`, `ticket_id`, `device_id` when it named one, `level`, `effective_level`, `promoted`, `batch_id`, `batch_label`, `version`, `ready_at`, `waited_seconds`, `position` (its place among waiting requests), `attempts`, `urgent_hint`, and `problem` while it is valid but cannot be granted. Granted and blocked requests hold no position |
 | `POST bench/<device id>/clear` | A person confirms a `needs-check` or `offline` device is free: `cleared`, and `false` for an unknown device or one no person has to confirm. The device goes `idle` and the queue continues |
+| `POST bench/queue/<request id>/level` with `{"operator", "level", "reason"}` | Raises or lowers a waiting request: its `level`, `effective_level` and new `queue_version`. Only a request that holds no device can change, and the operator is recorded as a declaration (`actorVerified: false`) |
+| `POST bench/queue/<request id>/reorder` with `{"operator", "request_id"?, "before"?, "after"?, "queue_version", "reason"}` | Moves a waiting request before or after another of the same effective level that shares a compatible device; with no `request_id`, `before` moves it to the front and `after` to the back. Returns `moved`, the new waiting `position` and `queue_version`; a `queue_version` that no longer matches answers 409 with the current one |
+| `POST bench/queue/<request id>/retry` with `{"operator"}` | Clears a blocked request's failures so the host tries it again in its old place: `retried`, and `false` for a request that is not blocked |
 
 Health entries are grouped by responsibility:
 

@@ -8,6 +8,8 @@ Ask for one with `orchestrator_bench_request`, naming what the work needs in `ca
 The tool returns `granted` with a lease, a token and the wrapper command to run, or `queued` with a `request_id` while every compatible device is busy.
 A grant also arrives as a message; a queued request needs no further action while it waits, and calling `orchestrator_bench_request` again only reports what became of it.
 Do not wait in a shell or poll for a device: end the turn and the grant or the next message wakes you.
+Name the batch and the build you test with `batch_label` and `version` (`commit`, `artifact`) so a record can say what ran; a retest asks again and gets a new batch, while a retry keeps its batch and place.
+Set `urgent_hint` when the work truly blocks a release: it says why to a person, who decides whether to raise the request with the management route; it never raises the level by itself.
 
 Run every action through the command the grant names, which carries the lease and the token:
 `node "<stateDir>/bench/bench-adb.mjs" --lease <leaseId> --token <token> <action> <arguments...>`.

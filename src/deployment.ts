@@ -66,9 +66,13 @@ export interface BenchConfig {
   leaseSeconds: number
   /** How long a grant's model-capacity reservation may wait for its delivery before the grant is given back. */
   holdSeconds?: number
+  /** Seconds a normal request may wait before the host serves it as urgent; absent or 0 disables the promotion. */
+  promoteAfterSeconds?: number
+  /** The declared names allowed to change levels or order; absent accepts any operator's declaration (identity is unverified). */
+  operators?: string[]
   devices: BenchDevice[]
 }
-const BENCH_KEYS = ['adb', 'adbServerSocket', 'leaseSeconds', 'holdSeconds', 'devices'] as const
+const BENCH_KEYS = ['adb', 'adbServerSocket', 'leaseSeconds', 'holdSeconds', 'promoteAfterSeconds', 'operators', 'devices'] as const
 const DEVICE_KEYS = ['id', 'serial', 'projects', 'capabilities', 'actions', 'maintainer'] as const
 const benchText = (value: unknown, what: string): string => {
   if (typeof value !== 'string' || !value.trim()) throw new Error(`bench ${what} must be a non-empty string`)
@@ -140,8 +144,16 @@ export function benchConfigOf(value: unknown): BenchConfig | undefined {
   if (hold !== undefined && (typeof hold !== 'number' || !Number.isInteger(hold) || hold < 10 || hold > 600)) {
     throw new Error('bench holdSeconds must be a whole number of seconds from 10 to 600')
   }
+  const promote = block.promoteAfterSeconds
+  if (promote !== undefined && (typeof promote !== 'number' || !Number.isInteger(promote) || promote < 0 || promote > 86_400)) {
+    throw new Error('bench promoteAfterSeconds must be a whole number of seconds from 0 to 86400')
+  }
+  const operators = block.operators === undefined ? undefined : Array.isArray(block.operators)
+    ? block.operators.map((name, index) => benchText(name, `operators[${index}]`)) : undefined
+  if (block.operators !== undefined && operators === undefined) throw new Error('bench operators must be a list of operator names')
   return { adb, ...socket === undefined ? {} : { adbServerSocket: socket }, leaseSeconds: seconds,
-    ...hold === undefined ? {} : { holdSeconds: hold }, devices }
+    ...hold === undefined ? {} : { holdSeconds: hold }, ...promote === undefined ? {} : { promoteAfterSeconds: promote },
+    ...operators === undefined ? {} : { operators }, devices }
 }
 
 /** Read machine settings and reject unknown configuration keys (naming where deprecated keys moved). */

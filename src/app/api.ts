@@ -9,6 +9,7 @@ import type { SourceStatusView } from './views/sources.ts'
 import type { DecisionListView, SearchView, ThreadDetailView, ThreadListView } from './views/threads.ts'
 import type { TicketListView } from './views/tickets.ts'
 import type { BenchView } from '../executor/bench.ts'
+import type { BenchLevel } from '../executor/bench-authorize.ts'
 
 export const TICKET_FILTERS = ['open', 'person', 'working', 'idle', 'ended'] as const
 export const THREAD_FILTERS = ['subscribed', 'evaluating', 'recent', 'all'] as const
@@ -43,7 +44,11 @@ export interface Api {
   'GET models': { response: ModelCatalog }
 'GET bench': { response: BenchView }
 'POST bench/:id/clear': { response: { cleared: boolean } }
-'POST bench/queue/:id/retry': { response: { retried: boolean } }
+'POST bench/queue/:id/level': { body: { operator: string; level: BenchLevel; reason: string }
+  response: { level: BenchLevel; effective_level: BenchLevel; queue_version: number } }
+'POST bench/queue/:id/reorder': { body: { operator: string; request_id?: string; before?: boolean; after?: boolean
+  queue_version: number; reason: string }; response: { moved: true; position: number; queue_version: number } }
+'POST bench/queue/:id/retry': { body: { operator?: string }; response: { retried: boolean } }
   'GET prompts': { query?: { revision?: number; offset?: number }; response: PromptsView }
   'PUT prompts': { body: { config: PromptConfig; baseRevision: number }; response: { revision: number; context_delivery: Delivery } }
   'POST prompts/preview': { body: PromptConfig; response: ReturnType<Prompts['preview']> }

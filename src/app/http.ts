@@ -14,7 +14,7 @@ import { SetupError, type SetupProblem } from '../setup.ts'
 import { UserError, type EngineForPeople, type Ticket } from '../core/index.ts'
 import { accountName, type Deployment, type Machine } from '../deployment.ts'
 import type { DshExecutor } from '../executor/dsh.ts'
-import type { BenchService } from '../executor/bench.ts'
+import { BenchConflict, type BenchService } from '../executor/bench.ts'
 import type { Health } from '../sources/host.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
 import type { Sessions } from './sessions.ts'
@@ -40,7 +40,7 @@ export interface HttpHost {
   readonly engine: EngineForPeople
   readonly executor: Pick<DshExecutor, 'activeCount'>
   /** The bench devices this installation leases, which only an operator confirms as free; absent when none is configured. */
-  readonly bench?: Pick<BenchService, 'view' | 'clear' | 'retry'>
+  readonly bench?: Pick<BenchService, 'view' | 'clear' | 'retry' | 'setLevel' | 'reorder'>
   readonly health: Record<string, Health>
   readonly machine: Machine
   readonly masterId: string
@@ -90,6 +90,7 @@ function failure(error: unknown): [number, Record<string, unknown>] {
   if (error instanceof RouteError) return [error.status, { error: error.message }]
   if (error instanceof UserError) return [error.missing ? 404 : 400, { error: error.message, code: error.code, values: error.values }]
   if (error instanceof SettingsConflict || error instanceof PromptConflict) return [409, { error: error.message }]
+  if (error instanceof BenchConflict) return [409, { error: error.message, queue_version: error.queueVersion }]
   return [500, { error: error instanceof Error ? error.message : String(error) }]
 }
 
@@ -208,10 +209,31 @@ function routes(runtime: HttpHost): Routes {
     'POST setup/check': () => { runtime.checkSetup(); return { restarting: true } },
     'GET models': () => runtime.models(),
     // The bench devices an operator may confirm free after a failed probe, an expiry or a restart that left a lease behind.
-    'GET bench': () => runtime.bench?.view() ?? { devices: [], queue: [] },
+    'GET bench': () => runtime.bench?.view() ?? { devices: [], queue: [], queue_version: 0 },
     'POST bench/:id/clear': ({ params }) => ({ cleared: runtime.bench?.clear(decoded(params.id)) ?? false }),
-    // A request the host stopped trying after repeated failures: a person clears its failure budget.
-    'POST bench/queue/:id/retry': ({ params }) => ({ retried: runtime.bench?.retry(decoded(params.id)) ?? false }),
+    // A person changes one waiting request: its level, its place, or (after repeated failures) its retry. Every such call
+    // declares an operator name; the host records it as a declaration, never as a verified identity (requirement A-12).
+    'POST bench/queue/:id/level': async ({ params, body }) => {
+      const change = z.object({ operator: z.string().min(1).max(120), level: z.enum(['normal', 'urgent']),
+        reason: z.string().min(1).max(500) }).strict().parse(await body())
+      const service = runtime.bench
+      if (!service) throw new RouteError(404, 'this installation leases no bench device')
+      return service.setLevel(decoded(params.id), change)
+    },
+    'POST bench/queue/:id/reorder': async ({ params, body }) => {
+      const move = z.object({ operator: z.string().min(1).max(120), request_id: z.string().min(1).optional(),
+        before: z.boolean().optional(), after: z.boolean().optional(), queue_version: z.number().int().nonnegative(),
+        reason: z.string().min(1).max(500) }).strict().parse(await body())
+      const service = runtime.bench
+      if (!service) throw new RouteError(404, 'this installation leases no bench device')
+      return service.reorder(decoded(params.id), { operator: move.operator, ...move.request_id ? { target: move.request_id } : {},
+        ...move.before === undefined ? {} : { before: move.before }, ...move.after === undefined ? {} : { after: move.after },
+        queueVersion: move.queue_version, reason: move.reason })
+    },
+    'POST bench/queue/:id/retry': async ({ params, body }) => {
+      const retry = z.object({ operator: z.string().min(1).max(120).optional() }).strict().parse((await body()) ?? {})
+      return { retried: runtime.bench?.retry(decoded(params.id), retry.operator) ?? false }
+    },
     'GET prompts': ({ query }) => { const { revision, offset } = PromptsQuery.parse(query); return promptsView(runtime, revision, offset) },
     'PUT prompts': async input => {
       const request = z.object({ config: z.unknown(), baseRevision: z.number().int().nonnegative() }).parse(await promptBody(input))

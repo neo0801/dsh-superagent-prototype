@@ -47,7 +47,7 @@ function validLease(overrides: Partial<BenchLease> = {}): BenchLease {
 }
 function validRuntime(overrides: { lease?: Partial<BenchLease>; device?: Partial<BenchDeviceRecord> } = {}): BenchRuntime {
   const lease = validLease(overrides.lease)
-  return { version: 1, queue: [], leases: { [lease.id]: lease }, retired: {}, revision: 0,
+  return { version: 2, queue: [], leases: { [lease.id]: lease }, retired: {}, revision: 0, order: [], audit: [], batchCount: {},
     devices: { [DEVICE_ID]: { state: 'busy', serial: SERIAL, leaseId: lease.id, ...overrides.device } } }
 }
 /** A ticket that satisfies `benchEligible` for `ASSIGNMENT_ID` until an override breaks one of its conditions. */
@@ -194,7 +194,9 @@ describe('benchRefusal explains why a credential may not use its lease', () => {
   })
   it('refuses an unreadable or wrong-version ledger', () => {
     expect(benchRefusal(undefined, liveTicketFixture(), credential, AT)).toBe('runtime')
-    expect(benchRefusal({ ...validRuntime(), version: 2 } as unknown as BenchRuntime, liveTicketFixture(), credential, AT)).toBe('runtime')
+    // Both ledger versions are readable: the host upgrades a version-1 record in place, and the wrapper may read it first.
+    expect(benchRefusal({ ...validRuntime(), version: 1 } as unknown as BenchRuntime, liveTicketFixture(), credential, AT)).toBeUndefined()
+    expect(benchRefusal({ ...validRuntime(), version: 3 } as unknown as BenchRuntime, liveTicketFixture(), credential, AT)).toBe('runtime')
   })
   it('refuses a lease that is not active, a wrong token and an expired lease', () => {
     const runtime = validRuntime()
