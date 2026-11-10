@@ -354,7 +354,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/views/overview.ts` | The overview: Tickets that need a person, problems, the last day's flow and the Executor's load |
 | `src/executor/dsh.ts` | The DshExecutor, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions` |
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents`, `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
-| `src/executor/bench.ts` | The BenchService: the devices, the FIFO of requests, exclusive leases and their revocation, the `bench-granted` Input a grant delivers, the release that waits for a call still in flight, `recover` and `reconcile`, and `benchWrapperSource` and `writeBenchWrapper`, which write `<stateDir>/bench/bench-adb.mjs` |
+| `src/executor/bench.ts` | The BenchService: the devices, the requests waiting in order, exclusive leases and their revocation, the `bench-granted` Input a grant delivers, the allocation pass that skips a request its devices cannot serve and retries one that rolled back, the release that waits for a call still in flight and re-reads the record, `recover`, `reconcile`, `view` and `clear`, and `benchWrapperSource` and `writeBenchWrapper`, which write `<stateDir>/bench/bench-adb.mjs` |
 | `src/executor/bench-authorize.ts` | The stored bench runtime (`BenchRuntime`: devices, queue, leases and retired evidence), `benchEligible`, the credentials and refusals both the host and the wrapper apply, and `parseBenchCall`, which splits a wrapper's arguments into a credential and an adb action |
 | `src/executor/bench-adb.ts` | What the generated wrapper runs: `runBenchAdb`, the call registry under `stateDir/bench/calls/`, `probeAdb`, the host's `adb -s <serial> get-state`, `adbEnvironment`, `benchAdbModuleUrl`, and `readSnapshot`, which reads the Store's database read-only |
 | `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. `CliError` carries the code a command's output reports, such as a GitHub HTTP status, and a command that prints nothing fails with how it ended, never with its arguments; `validItems` skips and counts the malformed items of a list |
@@ -418,10 +418,10 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
 | `tests/assessment.spec.ts` | What the MasterAssessor keeps per Eval, and when it lets go |
 | `tests/background.spec.ts` | Waiting for a worker's shell jobs and subagents: an end that woke it, and a host that stops |
-| `tests/bench.spec.ts` | The BenchService on a real Store: configuration validation, FIFO requests and grants, an offline probe, revocation, a release with calls in flight, `reconcile`, recovery after a restart, a changed configuration's retired evidence, `clear` and `view` |
+| `tests/bench.spec.ts` | The BenchService on a real Store: configuration validation, queued requests and grants, a request served past one whose devices are all busy, an offline probe, revocation, a release with calls in flight and one whose lease stops qualifying while it waits, `reconcile`, the allocation pass after recovery and its bounded retry, recovery after a restart, a changed configuration's retired evidence, `clear` and `view` |
 | `tests/bench-tools.spec.ts` | The worker's bench tools: their schemas, the Assignment taken when they execute, every result they map, and the withdrawn grant that `DshExecutor` drops without a failed delivery |
 | `tests/bench-adb.spec.ts` | The wrapper's parser and every refusal, the call registry, `adbEnvironment`, `probeAdb`, the built `bench-adb` entry, and the generated wrapper run as a process |
-| `tests/bench-runtime.spec.ts` | What a Runtime assembles: the lease tools and the skill on a worker only, none without devices, a team skill of that name replacing the packaged one, and a queued request that holds no device and no worker slot |
+| `tests/bench-runtime.spec.ts` | What a Runtime assembles: the lease tools and the skill on a worker only, none without devices, a team skill of that name replacing the packaged one, a queued request that holds no device and no worker slot, and the management routes that show the devices and confirm one free |
 | `tests/bundle-patch.spec.ts` | The bundle's patch, read as DeepSeek Harness reads it, and the agent preset of Executor Sessions it defines |
 | `tests/effects.spec.ts` | The effect queue: coalescing, limits, retries with backoff, health and shutdown |
 | `tests/passes.spec.ts` | Passes: one at a time, the ones asked for during a pass run as one after it, and the runtime health a failed pass reports |
@@ -544,6 +544,8 @@ Each Executor has six application tools:
 A hand-back returns `queued: false` if another Ticket still owns the message, or this Ticket never owned it. For example, a bot message went to Eval independently.
 
 An installation whose configuration names bench devices gives each Executor two more tools, `orchestrator_bench_request` and `orchestrator_bench_release`, and the bench skill. Both tools act for the Assignment running at the moment of the call, so a request or a release left over from an ended Assignment is refused. The main Session receives neither tool nor the skill, and reads a grant only as a Ticket Input.
+
+A device that waits for a person leaves that state only through the management API: `GET bench` shows each device with its state and the requests still waiting, and `POST bench/<device id>/clear` confirms a `needs-check` or `offline` device free. Neither is a Worker tool, so no Worker can clear a device for itself.
 
 `tests/model-surface.spec.ts` checks the surface of an installation that names no device, which is what that suite configures.
 

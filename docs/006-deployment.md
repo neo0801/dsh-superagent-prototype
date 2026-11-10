@@ -139,7 +139,7 @@ bench:
 - `leaseSeconds` is between 60 and 86400, defaulting to 1800.
 - The block is read once at start, so a change needs a restart.
 
-At start, a configured installation writes `<stateDir>/bench/bench-adb.mjs`, the wrapper through which Workers reach a leased device, and creates `<stateDir>/bench/calls/`, where a running call registers itself. The leases and the waiting requests live in the database under the `bench:runtime` key, so back up `orchestrator.sqlite` with the state directory. [003 Execution](003-execution.md) describes what a Worker gets and how it gives the device back.
+At start, a configured installation writes `<stateDir>/bench/bench-adb.mjs`, the wrapper through which Workers reach a leased device, and creates `<stateDir>/bench/calls/`, where a running call registers itself. The leases and the waiting requests live in the database under the `bench:runtime` key, so back up `orchestrator.sqlite` with the state directory. A device a restart or a release left `needs-check`, or a probe left `offline`, serves no Worker until a person confirms it free with `POST bench/<device id>/clear`; `GET bench` shows each device's state and the requests waiting. [003 Execution](003-execution.md) describes what a Worker gets and how it gives the device back.
 
 ## Start and stop
 
@@ -228,6 +228,8 @@ Agents may rely on these routes and fields. The other routes in `src/app/api.ts`
 | `POST policy-sync/<source id>` | Syncs that Source's allowed list now: `policy`, the Source's part as saved |
 | `GET prompts`, `PUT prompts` with `{"config", "baseRevision"}` | Reads the prompt configuration: `current`, with its `revision` and `config`, `defaults`, `sections`, the team sections in the order Sessions read them, `skillName`, the pattern of a team skill's name, `builtin`, the names a team skill cannot take, and `skillPrefix`, which Sessions load a skill's name under. Or saves it: the new `revision` |
 | `POST tickets/<id>/retry`, `POST tickets/<id>/stop` | Retries or stops a Ticket, as the panel does |
+| `GET bench` | The bench devices, each with `id`, `serial`, `state` (`idle`, `busy`, `needs-check` or `offline`), the `lease_id`, `ticket_id` and `expires_at` it serves, and its `note` when it waits for a person; and `queue`, the requests still waiting in order, each with `request_id`, `ticket_id`, `device_id` when it named one, and `ready_at`. Both empty on an installation that names no device |
+| `POST bench/<device id>/clear` | A person confirms a `needs-check` or `offline` device is free: `cleared`, and `false` for an unknown device or one no person has to confirm. The device goes `idle` and the queue continues |
 
 Health entries are grouped by responsibility:
 
