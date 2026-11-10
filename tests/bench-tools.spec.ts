@@ -66,6 +66,11 @@ describe('orchestrator_bench_request schema', () => {
     expect(request.schema.safeParse({ capabilities: ['android-13', 'camera'] }).success).toBe(true)
     expect(request.schema.safeParse({ device: 'bench-a' }).success).toBe(true)
   })
+  it('keeps the request id of a refusal a person must act on', async () => {
+    const { request: blocked } = toolsFor({ current: () => ticket([assignment('assignment-1')]),
+      request: { state: 'unavailable', reason: 'the request is blocked for a person', request_id: 'request-1' } })
+    expect(await run(blocked)({})).toEqual({ state: 'unavailable', reason: 'the request is blocked for a person', request_id: 'request-1' })
+  })
   it('rejects unknown keys and empty values', () => {
     expect(request.schema.safeParse({ priority: 1 }).success).toBe(false)
     expect(request.schema.safeParse({ capabilities: [''] }).success).toBe(false)

@@ -86,7 +86,7 @@ export interface ExecutorHost {
   /** Stored Trigger of the message `trigger` replies to, when it replies to one. */
   repliedTo(trigger: Trigger): Trigger | undefined
   /** The bench devices leased to workers, which a stop revokes and a delivery re-checks; absent when none is configured. */
-  readonly bench?: Pick<BenchService, 'revokeForTicket' | 'grantValid' | 'deliveryFailed' | 'delivered' | 'pump'>
+  readonly bench?: Pick<BenchService, 'revokeForTicket' | 'grantValid' | 'deliveryFailed' | 'delivered' | 'accepted' | 'pump'>
 }
 /** Looks up a ticket's origin trigger in Store. */
 export const sourceTrigger = (host: { store: Pick<Store, 'triggers'> }, ticket: Ticket): Trigger | undefined =>
@@ -237,8 +237,15 @@ export class WorkerSlots {
     this.starting.set(ticketId, by)
     return true
   }
-  /** Releases `ticketId`'s starting slot once its worker session is running or the launch/wake attempt has ended. */
-  free(ticketId: string): void { this.starting.delete(ticketId); this.startingHold.delete(ticketId) }
+  /**
+   * Releases `ticketId`'s starting slot once its worker session is running or the launch/wake attempt has ended. A
+   * reservation that owns the slot keeps it: the reservation's own release decides when the slot goes, so a bench grant
+   * that borrowed an in-flight start cannot lose its count when that start finishes.
+   */
+  free(ticketId: string): void {
+    if (this.startingHold.has(ticketId)) return
+    this.starting.delete(ticketId)
+  }
   /**
    * Frees the starting slot a delivery claimed, but only while that delivery's own reservation still owns it: a newer
    * grant may have reserved the ticket again while the older delivery was still finishing.
@@ -249,8 +256,9 @@ export class WorkerSlots {
     this.startingHold.delete(ticketId)
   }
   /**
-   * Reserves a slot for a device grant that has not reached its worker yet: `undefined` when no slot is free, and a
-   * `covered` reservation (which adds no count) when the ticket already holds a starting slot.
+   * Reserves a slot for a device grant that has not reached its worker yet: `undefined` when no slot is free. When the
+   * ticket already starts, the reservation takes ownership of that start's slot (`covered`): it counts until its own
+   * release, and the start's `free` no longer ends it.
    */
   hold(ticketId: string, ttlMs: number, nowMs: number): WorkerHold | undefined {
     const existing = this.holdFor(ticketId)
@@ -258,9 +266,11 @@ export class WorkerSlots {
     const covered = this.starting.has(ticketId)
     if (!covered && this.used() >= this.max()) return undefined
     const hold: WorkerHold = { id: `hold-${++this.holdSeq}`, ticketId, at: new Date(nowMs).toISOString(),
-      expiresAt: new Date(nowMs + ttlMs).toISOString(), consumed: covered, covered }
+      expiresAt: new Date(nowMs + ttlMs).toISOString(), consumed: false, covered }
     this.holds.set(hold.id, hold)
-    if (!covered) { this.starting.set(ticketId, 'bench'); this.startingHold.set(ticketId, hold.id) }
+    // The reservation owns the slot either way: a borrowed start's slot lives until this hold is released or consumed.
+    if (!covered) this.starting.set(ticketId, 'bench')
+    this.startingHold.set(ticketId, hold.id)
     return hold
   }
   /** Releases a reservation; unknown or already-released ids are a no-op, so every termination path can call it. */
@@ -268,8 +278,8 @@ export class WorkerSlots {
     const hold = this.holds.get(id)
     if (!hold) return
     this.holds.delete(id)
-    if (hold.covered) return
-    if (this.startingHold.get(hold.ticketId) === id) this.startingHold.delete(hold.ticketId)
+    if (this.startingHold.get(hold.ticketId) !== id) return
+    this.startingHold.delete(hold.ticketId)
     this.starting.delete(hold.ticketId)
   }
   /** Records that a delivery took over the reservation: the slot now belongs to the worker it is starting. */
@@ -433,7 +443,7 @@ export class DshExecutor implements Executor {
             reserved = true
             const taken = this.slots.holdFor(ticketId)
             if (taken) { this.slots.consumeHold(taken.id); tookOver ??= taken }
-          } else reserved = true
+          }
         }
         let accepted = false, acceptedAt: string | undefined
         try {
@@ -441,7 +451,12 @@ export class DshExecutor implements Executor {
           if (!this.host.context.agents.get(sessionId as SessionId)) {
             await this.host.sessions.ensure(sessionId, ticket.execution?.directory ?? '', ticket.title, 'worker')
           }
-          if (input) await this.deliverInput(ticket, assignment, input, () => { accepted = true; acceptedAt = now() })
+          if (input) await this.deliverInput(ticket, assignment, input, () => {
+            accepted = true
+            acceptedAt = now()
+            // The first acceptance is kept even if the flush that follows fails; clearing the failure budget waits for it.
+            if (input.kind === 'bench-granted') this.host.bench?.accepted(input.leaseId, acceptedAt)
+          })
         } catch (error) {
           if (this.host.closing() || error instanceof Later) throw error
           // A bench grant that stopped being valid is withdrawn, not a failed delivery: no retry, and nothing to report.
@@ -467,7 +482,8 @@ export class DshExecutor implements Executor {
         if (input?.kind === 'bench-granted') this.host.bench?.delivered(input.leaseId, acceptedAt)
       }
     } finally {
-      if (tookOver && !tookOver.covered) this.slots.freeClaim(ticketId, tookOver.id)
+      // A taken-over reservation owns the slot it claimed; a slot this delivery reserved itself is freed only here.
+      if (tookOver) this.slots.freeClaim(ticketId, tookOver.id)
       else if (reserved) this.slots.free(ticketId)
       if (tookOver) this.slots.releaseHold(tookOver.id)
       // A freed slot or a released reservation may let a queued request be granted; the bench service does not watch these.

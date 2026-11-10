@@ -233,6 +233,8 @@ export interface BenchRecord { recordId: string; ticketId: string; assignmentId:
   missing: string[]
   /** Whether the host-only fields had to be trimmed to fit their budget; a seal is never refused for size. */
   truncated: boolean
+  /** A record written before the 28 KiB fact budget may seal slightly over 32 KiB; this flag states that exemption. */
+  oversized?: boolean
   verdict: BenchVerdict }
 
 const sleep = (ms: number): Promise<void> => new Promise(resolve => { setTimeout(resolve, ms).unref?.() })
@@ -290,21 +292,20 @@ export class BenchService {
     const runtime = stored as BenchRuntime
     if (version === 1) {
       const sorted = [...runtime.queue].sort((a, b) => a.readyAt.localeCompare(b.readyAt) || a.id.localeCompare(b.id))
-      // The batch counter resumes after every batch a migrated request already names, so a retest cannot reuse one.
-      const batchCount: Record<string, number> = {}
-      for (const item of sorted) {
-        const named = Number(item.batchId?.split('-').at(-1))
-        if (Number.isFinite(named)) batchCount[item.ticketId] = Math.max(batchCount[item.ticketId] ?? 0, named)
-      }
       Object.assign(runtime, { version: 2, order: sorted.map(item => ({ requestId: item.id,
-        phase: item.blocked ? 'blocked' as const : 'queued' as const })), audit: [], batchCount, revision: 0 })
+        phase: item.blocked ? 'blocked' as const : 'queued' as const })), audit: [], batchCount: {}, revision: 0 })
     }
     runtime.revision ??= 0
     runtime.audit ??= []
     runtime.order ??= []
     runtime.batchCount ??= {}
+    // Defaults come first: the batch counter can only resume from a batch id that exists, and a migration supplies it.
     for (const request of runtime.queue) this.defaultsOf(request)
     for (const lease of Object.values(runtime.leases)) if (lease.request) this.defaultsOf(lease.request)
+    for (const request of [...runtime.queue, ...Object.values(runtime.leases).flatMap(lease => lease.request ? [lease.request] : [])]) {
+      const named = Number(request.batchId?.split('-').at(-1))
+      if (Number.isFinite(named)) runtime.batchCount[request.ticketId] = Math.max(runtime.batchCount[request.ticketId] ?? 0, named)
+    }
     return runtime
   }
   /** Fills the fields a request written before this version existed lacks. */
@@ -558,7 +559,9 @@ export class BenchService {
     this.mutate(runtime => {
       if (runtime.queue.some(item => item.id === requestId)) return
       // A batch is the unit a person reasons about: a retest asks again and gets a new one, a retry keeps its own.
-      const batch = (runtime.batchCount[ticketId] ?? 0) + 1
+      // Never reuse a batch id a request of this ticket already names, even if a counter was lost by an earlier upgrade.
+      const named = runtime.queue.flatMap(item => item.ticketId === ticketId ? [Number(item.batchId?.split('-').at(-1))] : []).filter(Number.isFinite)
+      const batch = Math.max(runtime.batchCount[ticketId] ?? 0, ...named) + 1
       runtime.batchCount[ticketId] = batch
       runtime.queue.push({ id: requestId, ticketId, assignmentId, capabilities, ...deviceId ? { deviceId } : {},
         readyAt: this.clock(), level: 'normal', batchId: `b-${ticketId}-${batch}`,
@@ -778,6 +781,22 @@ export class BenchService {
     void this.pump()
   }
   /**
+   * The first time the notification chain accepted a grant, kept even when the flush that follows fails: it is evidence of
+   * the notification path, not of the device, and it never clears the failure budget (that waits for delivered).
+   */
+  accepted(leaseId: string, acceptedAt: string): void {
+    this.host.store.atomic(() => {
+      const runtime = this.runtime()
+      const lease = runtime.leases[leaseId]
+      if (!lease || lease.state !== 'active' || lease.acceptedAt) return
+      lease.acceptedAt = acceptedAt
+      const record = this.host.store.get(KV.bench.records(lease.ticketId, lease.id))
+      if (record?.state === 'open') this.host.store.set(KV.bench.records(lease.ticketId, lease.id),
+        { ...record, acceptedAt: record.acceptedAt ?? acceptedAt })
+      this.write(runtime)
+    })
+  }
+  /**
    * The grant's Input crossed the enqueue point, so the hand-off completed: the request's failure budget clears and the
    * lease and its open record keep the acceptance time. That time is what the notification chain observed, never a device
    * fact; it is recorded as evidence for the notification path, not as proof that the device ran anything.
@@ -785,12 +804,16 @@ export class BenchService {
   delivered(leaseId: string, acceptedAt?: string): void {
     this.mutate(runtime => {
       const lease = runtime.leases[leaseId]
-      if (!lease) return
+      // A late success of an ended attempt changes nothing: only the attempt that is still handing off may settle.
+      if (!lease || lease.state !== 'active') return
       const at = acceptedAt ?? this.clock()
       lease.acceptedAt ??= at
       if (lease.request) { lease.request.attempts = 0; delete lease.request.blocked; delete lease.request.problem }
       const queued = runtime.queue.find(item => item.id === lease.requestId)
-      if (queued) { queued.attempts = 0; delete queued.blocked; delete queued.problem }
+      // The request may be a later attempt of the same Assignment: clear its budget only when its evidence matches.
+      const sameAttempt = !!queued && !!lease.request && queued.readyAt === lease.request.readyAt
+        && queued.batchId === lease.request.batchId && queued.attempts === lease.request.attempts
+      if (queued && sameAttempt) { queued.attempts = 0; delete queued.blocked; delete queued.problem }
       const record = this.host.store.get(KV.bench.records(lease.ticketId, lease.id))
       if (record && record.state === 'open') {
         this.host.store.set(KV.bench.records(lease.ticketId, lease.id), { ...record, acceptedAt: record.acceptedAt ?? at,
@@ -848,6 +871,8 @@ export class BenchService {
     if (reason === 'temporarily-ineligible') restored.problem = detail ?? REVOKE_TEXT[reason]
     if (counted && attempts >= FAILURE_LIMIT) {
       restored.blocked = { reason: detail ?? REVOKE_TEXT[reason], at: this.clock(), attempts }
+      // The transition that blocks a request is audited wherever it happens, including a revoke that crossed the limit.
+      this.audit(runtime, { at: restored.blocked.at, action: 'block', requestId: restored.id, reason: restored.blocked.reason })
     }
     const index = runtime.queue.findIndex(item => item.id === restored.id)
     if (index >= 0) runtime.queue[index] = restored
@@ -1028,6 +1053,9 @@ export class BenchService {
     record.missing = requiredMissingOf(record)
     record.verdict = verdictOf(record)
     trimHostSuffix(record)
+    // A record written before the 28 KiB fact budget may not fit 32 KiB even with an empty suffix; keep the facts and
+    // state the exemption instead of deleting test evidence or refusing the seal.
+    if (recordBytes(record) > RECORD_BYTES) record.oversized = true
     this.host.store.set(KV.bench.records(lease.ticketId, lease.id), record)
   }
 
@@ -1101,16 +1129,15 @@ export class BenchService {
         this.markFailure(request.id, 'the grant rolled back or the device kept failing')
         skip.add(device.id)
       }
-      if (!progress) {
-        // A request whose every compatible device failed its probe in this pass is a failed attempt, counted once per pass.
-        for (const request of candidates) {
-          const devices = this.compatible(request.capabilities, request.deviceId)
-          if (devices.length && devices.every(device => probed.has(device.id))) {
-            this.markFailure(request.id, 'no compatible device answered its probe')
-          }
+      // Counted before deciding whether this pass made progress: another request's grant or reshuffle must not lose the
+      // failure of a request whose every compatible device failed its probe in this pass.
+      for (const request of candidates) {
+        const devices = this.compatible(request.capabilities, request.deviceId)
+        if (devices.length && devices.every(device => probed.has(device.id))) {
+          this.markFailure(request.id, 'no compatible device answered its probe')
         }
-        return
       }
+      if (!progress) return
     }
   }
   /** Drops requests whose ticket ended or changed its Assignment; a request waiting for a person stays with its problem. */

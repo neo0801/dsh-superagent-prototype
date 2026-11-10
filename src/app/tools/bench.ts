@@ -43,7 +43,8 @@ export function benchTools(host: BenchToolsHost, ticket: Ticket): Tool[] {
             device_id: result.lease.deviceId, serial: result.lease.serial, expires_at: result.lease.expiresAt, command: result.lease.command }
         }
         return result.state === 'queued' ? { state: 'queued', request_id: result.request_id, devices: result.devices }
-          : { state: 'unavailable', reason: result.reason }
+          // A refusal that names a waiting or blocked request keeps its id so a person can act on it.
+          : { state: 'unavailable', reason: result.reason, ...result.request_id ? { request_id: result.request_id } : {} }
       },
     }),
     tool({
@@ -76,16 +77,17 @@ export function benchTools(host: BenchToolsHost, ticket: Ticket): Tool[] {
         + 'identities, seals the record when the device is released and derives the verdict from these facts; a later attempt is a '
         + 'new record. Write only what you observed: the host never verifies the evidence itself.',
       schema: z.object({
-        lease_id: z.string().min(1).describe('The lease this attempt runs under, as the grant named it; a stale attempt cannot write into a newer lease.'),
-        cases: z.array(z.object({ id: z.string().min(1).max(100), expected: z.string().min(1).max(2000),
-          actual: z.string().min(1).max(2000), outcome: z.enum(['passed', 'failed', 'insufficient-evidence']),
+        lease_id: z.string().trim().min(1).describe('The lease this attempt runs under, as the grant named it; a stale attempt cannot write into a newer lease.'),
+        cases: z.array(z.object({ id: z.string().trim().min(1).max(100), expected: z.string().trim().min(1).max(2000),
+          actual: z.string().trim().min(1).max(2000), outcome: z.enum(['passed', 'failed', 'insufficient-evidence']),
           note: z.string().max(1000).optional() }).strict()).max(50).optional().describe('What this attempt ran, expected and saw.'),
         installed: z.object({ artifact: z.string().min(1).max(500), config: z.string().max(500).optional(),
           input: z.string().max(500).optional() }).strict().optional().describe('The build, configuration and input installed for the test.'),
         na: z.object({ config: z.literal(true).optional(), input: z.literal(true).optional() }).strict().optional()
           .describe('Mark a field that does not apply to this test, instead of omitting it.'),
-        evidence: z.object({ logs: z.array(z.string().max(500)).max(50).optional(),
-          screenshots: z.array(z.string().max(500)).max(50).optional(), artifacts: z.array(z.string().max(500)).max(50).optional() }).strict()
+        evidence: z.object({ logs: z.array(z.string().trim().min(1).max(500)).max(50).optional(),
+          screenshots: z.array(z.string().trim().min(1).max(500)).max(50).optional(),
+          artifacts: z.array(z.string().trim().min(1).max(500)).max(50).optional() }).strict()
           .optional().describe('Where the evidence lives, under bench-evidence/<batch>/<lease>/; the host never reads it.'),
         completed_at: z.string().min(1).optional().describe('When the test completed; a passed verdict needs it.'),
         note: z.string().max(2000).optional(),

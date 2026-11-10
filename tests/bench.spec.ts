@@ -1005,15 +1005,17 @@ describe('worker slot reservations (S1)', () => {
     service.releaseHold(hold!.id)
     expect(service.used()).toBe(0)
   })
-  it('adds no count when the ticket already holds a starting slot', () => {
+  it('keeps ownership of a borrowed starting slot until the reservation ends', () => {
     const service = slots(1)
     service.reserve('t1', 'wake')
-    const hold = service.hold('t1', 60_000, Date.parse(AT))
-    expect(hold).toMatchObject({ covered: true })
+    const hold = service.hold('t1', 60_000, Date.parse(AT))!
+    expect(hold).toMatchObject({ covered: true, consumed: false })
     expect(service.used()).toBe(1)
-    service.releaseHold(hold!.id)
-    expect(service.used()).toBe(1)
+    // The in-flight start ends, but the reservation still owns the slot, so nothing else may take it.
     service.free('t1')
+    expect(service.used()).toBe(1)
+    expect(service.hold('t2', 60_000, Date.parse(AT))).toBeUndefined()
+    service.releaseHold(hold.id)
     expect(service.used()).toBe(0)
   })
   it('sweeps only reservations a delivery never took over', () => {
@@ -1158,6 +1160,8 @@ describe('queue order, levels and reordering (S2)', () => {
     }
     expect(queue(service)).toHaveLength(1)
     expect(queue(service)[0]).toMatchObject({ ticket_id: 't1', blocked: 'the grant could not be delivered', attempts: 5 })
+    // The transition that blocked it is audited, not only the revoke that crossed the limit.
+    expect(service.runtime().audit.filter(entry => entry.action === 'block')).toHaveLength(1)
     expect(queue(service)[0]?.position).toBeUndefined()
     expect(service.runtime().order).toEqual([{ requestId: requestId('t1', 'a1'), phase: 'blocked' }])
     expect(service.retry(requestId('t1', 'a1'), 'zhang')).toBe(true)
@@ -1463,5 +1467,77 @@ describe('review regressions (F01-F11)', () => {
     expect(page.items.length).toBeLessThan(50)
     expect(page.next_offset).toBe(page.items.length)
     expect(Buffer.byteLength(JSON.stringify(page.items), 'utf8')).toBeLessThanOrEqual(8 * 1024)
+  })
+  it('ignores a late hand-off success after a later attempt is blocked (N2)', async () => {
+    const store = openStore()
+    const { service } = rig(store, { probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    const first = grantedOf(await service.request('t1', 'a1'))
+    for (let cycle = 0; cycle < 5; cycle++) {
+      const held = grantedOf(await service.request('t1', 'a1'))
+      service.deliveryFailed(held.lease.leaseId, 'the grant could not be delivered')
+      service.clear('bench-a')
+    }
+    const blocked = service.runtime().queue[0]!
+    expect(blocked).toMatchObject({ attempts: 5 })
+    expect(blocked.blocked).toBeDefined()
+    // The first attempt's lease was revoked long ago; its late success must not reopen the blocked request.
+    service.delivered(first.lease.leaseId, '2026-11-09T00:00:01.000Z')
+    expect(service.runtime().queue[0]).toMatchObject({ attempts: 5 })
+    expect(service.runtime().queue[0]?.blocked).toBeDefined()
+    expect(service.runtime().order[0]).toMatchObject({ phase: 'blocked' })
+  })
+  it('resumes the batch counter from a real version-1 queue without batch ids (N3)', async () => {
+    const store = openStore()
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    store.set(KV.bench.runtime, { version: 1, devices: {}, leases: {}, retired: {}, revision: 0,
+      queue: [{ id: requestId('t1', 'a1'), ticketId: 't1', assignmentId: 'a1', capabilities: [], readyAt: AT }] } as unknown as BenchRuntime)
+    const { service } = rig(store, { probe: async () => 'device' })
+    const first = grantedOf(await service.request('t1', 'a1'))
+    expect(service.runtime().leases[first.lease.leaseId]?.request?.batchId).toBe('b-t1-1')
+    releasedOf(await service.release('t1', 'a1', { leaseId: first.lease.leaseId }))
+    const second = grantedOf(await service.request('t1', 'a1'))
+    expect(service.runtime().leases[second.lease.leaseId]?.request?.batchId).toBe('b-t1-2')
+  })
+  it('counts a failed probe even when another request is served in the same pass (N4)', async () => {
+    const store = openStore()
+    const { service } = rig(store, { probe: async (serial: string) => serial === 'SERIAL-CAM' ? 'offline' as const : 'device' as const,
+      devices: [device('bench-cam', 'SERIAL-CAM', { capabilities: ['camera'] }), device('bench-can', 'SERIAL-CAN')] })
+    saveTicket(store, ticket('tA', [assignment('tA-a')]))
+    saveTicket(store, ticket('tB', [assignment('tB-a')]))
+    expect(await service.request('tA', 'tA-a', { capabilities: ['camera'] })).toMatchObject({ state: 'queued' })
+    expect(await service.request('tB', 'tB-a', { device: 'bench-can' })).toMatchObject({ state: 'granted' })
+    // B's grant in the same pass must not drop A's failure.
+    expect(service.runtime().queue.find(item => item.ticketId === 'tA')?.attempts).toBe(1)
+  })
+  it('keeps the first acceptance time when the flush that follows fails (N5)', async () => {
+    const store = openStore()
+    const { service } = rig(store, { probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    const held = grantedOf(await service.request('t1', 'a1'))
+    service.accepted(held.lease.leaseId, '2026-11-09T00:00:00.000Z')
+    expect(service.runtime().leases[held.lease.leaseId]?.acceptedAt).toBe('2026-11-09T00:00:00.000Z')
+    expect(service.readRecord('t1', held.lease.leaseId)?.acceptedAt).toBe('2026-11-09T00:00:00.000Z')
+    // A later successful delivery must keep the first time, not overwrite it with the retry's.
+    service.delivered(held.lease.leaseId, '2026-11-09T00:00:01.000Z')
+    expect(service.runtime().leases[held.lease.leaseId]?.acceptedAt).toBe('2026-11-09T00:00:00.000Z')
+    expect(service.readRecord('t1', held.lease.leaseId)?.acceptedAt).toBe('2026-11-09T00:00:00.000Z')
+  })
+  it('flags a pre-budget record that cannot fit 32 KiB instead of dropping facts (N6)', async () => {
+    const store = openStore()
+    const { service } = rig(store, { probe: async () => 'device' })
+    saveTicket(store, ticket('t1', [assignment('a1')]))
+    const held = grantedOf(await service.request('t1', 'a1'))
+    const open = service.readRecord('t1', held.lease.leaseId)!
+    // A record the old version allowed to grow to 32 KiB of facts: sealing it must keep the facts and state the exemption.
+    store.set(KV.bench.records('t1', held.lease.leaseId), { ...open,
+      cases: Array.from({ length: 50 }, (_, index) => ({ id: `c${index}`, expected: 'e'.repeat(600), actual: 'a'.repeat(600),
+        outcome: 'passed' as const })) })
+    expect(Buffer.byteLength(JSON.stringify(service.readRecord('t1', held.lease.leaseId)), 'utf8')).toBeGreaterThan(32 * 1024)
+    releasedOf(await service.release('t1', 'a1', { leaseId: held.lease.leaseId }))
+    const sealed = service.readRecord('t1', held.lease.leaseId)!
+    expect(sealed.state).toBe('sealed')
+    expect(sealed.cases).toHaveLength(50)
+    expect(sealed.oversized).toBe(true)
   })
 })
