@@ -3,6 +3,7 @@ import type { Ticket } from '../src/core/index.ts'
 import type { Deployment } from '../src/deployment.ts'
 import { environmentOf } from '../src/app/execution-environment.ts'
 import { composePrompt, composeSkill, defaultPrompts, environmentSection, Prompts } from '../src/app/prompts.ts'
+import { bundledSkill } from '../src/app/skill-files.ts'
 import { executorTools } from '../src/app/tools/executor.ts'
 import { SettingsSchema } from '../src/policy.ts'
 import { gitlabKind } from '../src/sources/gitlab.ts'
@@ -46,6 +47,18 @@ it('registers the GitLab skill instead of the GitHub one, with the operations se
   expect(body).toContain('target_branch')
   expect(body).toContain('pr_number')
   expect(body).toContain('DSH_SUPERAGENT_GITLAB_ACCOUNT')
+})
+
+it('recognises every packaged skill, so a Session gets its frontmatter description and its resource directory', () => {
+  for (const name of ['feishu', 'github', 'gitlab']) {
+    const skill = bundledSkill(name)
+    // The description comes from the frontmatter; a team's own skill falls back to the first 120 characters of its body.
+    expect(skill?.description, name).toBeTruthy()
+    expect(skill!.description).not.toBe(skill!.content.replace(/\s+/g, ' ').slice(0, 120))
+    expect(skill!.path.replace(/\\/g, '/').endsWith(`skills/dsh-superagent-${name}/SKILL.md`), name).toBe(true)
+  }
+  // An unknown name is a team skill: no packaged description and no resource directory to hand the model.
+  expect(bundledSkill('release')).toBeUndefined()
 })
 
 it('describes the report tool for GitLab and refuses pr_number there', async () => {

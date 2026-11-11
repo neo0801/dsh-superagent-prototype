@@ -13,7 +13,7 @@ A team can edit three team sections, add skills, and override every built-in sys
 | Delivery requirements | Evidence in pull requests, the auto-merge condition with its line threshold, and the commit author; without one, the Executor commits as the agent account's no-reply address |
 | Team skills | Knowledge the agents load when they need it, such as an `identities` skill that says which Feishu user is which GitHub account |
 
-The built-in text covers the roles, tool usage, host mechanics, authorization rules, and the GitHub and Feishu skills. It refers to the team sections by their headings instead of repeating them.
+The built-in text covers the roles, tool usage, host mechanics, authorization rules, and the Source skills. It refers to the team sections by their headings instead of repeating them.
 
 ### Built-in parts and templates
 
@@ -24,7 +24,7 @@ Overrides use these keys:
 | Shared instructions and roles | `runtime/shared`, `runtime/orchestrator`, `runtime/worker` |
 | Working instructions | `runtime/subscriptions`, `runtime/replies`, `runtime/dispatch`, `runtime/work`, `runtime/admission` |
 | Handoff instructions | `runtime/handoff/orchestrator`, `runtime/handoff/worker` |
-| Source skills | `skill/feishu`, `skill/github` |
+| Source skills | `skill/feishu`, and the deployment's provider: `skill/github` or `skill/gitlab` |
 | Generated sections | `runtime/environment`, `runtime/policy`, `runtime/policy/none` |
 
 The generated sections are editable templates. They must retain these placeholders:
@@ -40,6 +40,23 @@ On an explicit human request, the main Session can also save overrides with `orc
 An override records which built-in text it was based on. Upgrades preserve the team's text. If the default changes, the panel marks the part **Default updated** and shows the difference beside the team's text. The team can keep its text, use the new default or edit it. Parts without overrides automatically follow new defaults.
 
 The main Session can read affected part names in `orchestrator_read prompts`, under `default_changed`.
+
+## Skills
+
+A team skill added in the panel is text only: a kebab-case name and one markdown body, saved with the prompt configuration and registered in a Session as `dsh-superagent-<name>`. It carries no description of its own — the first words of its body serve as one — and no resource directory, so it is right for knowledge the agents quote (identities, conventions, local vocabulary) and wrong for anything that needs a script or a reference file.
+
+A skill that needs `scripts/`, `references/` or assets is a directory bundle on disk. DeepSeek Harness discovers `<name>/SKILL.md` under the repository the Executor works in (`.dsh/skills` or `.agents/skills` at the nearest `.git` ancestor) and under the user's `~/.dsh/skills`, parses its YAML frontmatter (required `name` and `description`, optional `whenToUse`), and tells the model the bundle's directory as the base for every relative path it mentions. The packaged Source skills work the same way: `skills/dsh-superagent-<feishu|github|gitlab>/SKILL.md`, whose directory is the base a load hands the model.
+
+A bundle is installed by committing it to the repository, so the change that adds it is reviewed like any other code. Nothing in the panel or the management API fetches a bundle from a path or a URL. The provider watches the roots it scans, so a committed bundle reaches the next catalog refresh without restarting dsh-superagent. A bundle is resource material, not authority:
+
+| | |
+| --- | --- |
+| Reads | its own directory, the Ticket worktree, and the repository the Executor works on |
+| Writes | only what the Executor may write: the Ticket worktree and its own temporary files |
+| Never | credential files, the deployment's state directory, another repository, or another account's material |
+| Tools | the same tools and sandbox as the Executor that loads it; a bundle cannot widen either, and listing one adds no network access, rule or Mandate |
+
+An installer that would fetch a bundle and judge it automatically is not part of this version. If one is added, a bundle that breaks the table above must not be installed on a check's own verdict: the check reports, and installing past a violation takes a person's explicit answer to continue, recorded with the findings it overrode.
 
 ## Assembly and precedence
 

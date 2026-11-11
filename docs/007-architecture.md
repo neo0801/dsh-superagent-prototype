@@ -282,7 +282,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 - Runtime sends `pullEndNotices` for merged or closed Tickets.
 - Executor tools bind reported pull requests with `readPull` and `claimPull`, using the GitHub context exposed by Runtime.
 - MasterAssessor reads repository files with `readRepositoryPath`.
-- Sessions and Prompts register built-in skills only for GitHub and Feishu. Migration converts their schema-10 records.
+- Sessions and Prompts register built-in skills for Feishu and the deployment's provider (GitHub or GitLab); `bundledSkill` decides which name is packaged, so a Session gets that skill's frontmatter description and its package directory as the resource base. Migration converts their schema-10 records.
 - Setup probes only GitHub and Feishu account fields (`SETUP_FIELDS`). Only those Sources receive account setup problems through `SourceContext.problem`.
 
 

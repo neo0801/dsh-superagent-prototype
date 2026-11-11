@@ -22,6 +22,9 @@ function load(name: string) {
   return { name: match[1]!, description: match[2]!, content: match[3]!, path }
 }
 export const bundledSkills = { feishu: load('feishu'), github: load('github'), gitlab: load('gitlab') }
+/** A packaged skill by name, or undefined for a team's own skill; Sessions read the description and the resource directory from it. */
+export const bundledSkill = (name: string): (typeof bundledSkills)[keyof typeof bundledSkills] | undefined =>
+  Object.hasOwn(bundledSkills, name) ? bundledSkills[name as keyof typeof bundledSkills] : undefined
 /**
  * Loads a built-in prompt file (`prompts/<name>.md`). Source `.md` files are written one sentence per line for
  * readable diffs; `promptFile` joins lines within each paragraph with spaces while keeping blank-line paragraph breaks.
