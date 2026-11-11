@@ -1,7 +1,7 @@
 /** Eval status view (Decision log) and Eval settings group (Policy rules, per-Source admission, and assessor settings). */
 import { useState } from 'react'
 import { ADMISSION_DEFAULTS, ADMISSION_OPTIONS, type Admission, type AdmissionCell } from '../admission.ts'
-import type { AdmissionRowView } from '../sources/kind.ts'
+import type { AdmissionRowView, FieldSpec } from '../sources/kind.ts'
 import { LIMITS } from '../limits.ts'
 import { DECISION_FILTERS, DECISION_KINDS, usePoll, type DecisionFilter, type Settings, type SourceView } from './api.ts'
 import { Button, DisclosureRow, Icon, InfoTip, Input, Pill, SegmentedControl, Switch } from './controls.tsx'
@@ -133,13 +133,28 @@ function AdmissionTable({ rows, labels, table, explicit, onChange }: {
   </Section>
 }
 
+/** Drops added rows left completely blank, so pressing add and then saving cannot refuse the whole Policy. */
+function withoutBlankRows(part: Part, fields: FieldSpec[]): Part {
+  const next = { ...part }
+  for (const field of fields) {
+    if (field.type !== 'rows') continue
+    const rows = next[field.key]
+    if (!Array.isArray(rows)) continue
+    next[field.key] = rows.filter(row => Object.values(row as Record<string, unknown>)
+      .some(cell => String(cell ?? '').trim() !== ''))
+  }
+  return next
+}
+
 function PolicyBlock() {
   const { t } = usePanel()
   const { settings: { blocks, sources, policyVersion }, reload } = useSettings()
-  const draft = useBlockDraft('policy', blocks.policy.value, blocks.policy.revision)
+  const parts = sources.filter(source => source.installed && source.policy)
+  const prune = (value: typeof blocks.policy.value) => ({ ...value, sources: Object.fromEntries(Object.entries(value.sources)
+    .map(([id, part]) => [id, withoutBlankRows(part as Part, parts.find(source => source.id === id)?.policy?.fields ?? [])])) })
+  const draft = useBlockDraft('policy', blocks.policy.value, blocks.policy.revision, prune)
   const policy = draft.value
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
-  const parts = sources.filter(source => source.installed && source.policy)
   const [tab, setTab] = useState<string>()
   const current = parts.find(source => source.id === tab) ?? parts[0]
   const edit = (next: Partial<typeof policy>) => draft.edit({ ...policy, ...next })

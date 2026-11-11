@@ -98,6 +98,22 @@ it('syncs a Source\'s list from where the Source keeps it, but not while a Polic
   expect(server.requests.slice(before).some(request => request.path.startsWith('policy-sync'))).toBe(false)
 })
 
+it('drops a row left completely blank rather than refusing the Policy it was added to', async () => {
+  await mount()
+  await click(zh['tab.eval'])
+  await click(find(zh['tab.settings'], '.dt-status-head button'))
+  // The row is added on GitHub's own tab and left there: a tab that is not shown has no inputs for the browser to check,
+  // so the blank id would reach the Policy, which refuses it.
+  await click(find('GitHub', '.dt-subtabs [role="tab"]'))
+  expect(all('.dt-rows-item')).toHaveLength(1)
+  await click(find(zh.addRow, '.dt-part button'))
+  expect(all('.dt-rows-item')).toHaveLength(2)
+  await click(find('飞书', '.dt-subtabs [role="tab"]'))
+  await click(zh.save)
+  expect(server.requests.some(request => request.method === 'PUT' && request.path === 'settings/policy')).toBe(true)
+  expect(server.settings.policy.sources.github!.allowed).toHaveLength(1)
+})
+
 it('adds, copies, renames, disables and deletes rules in Policy without touching Eval', async () => {
   await mount()
   await click(zh['tab.eval'])
