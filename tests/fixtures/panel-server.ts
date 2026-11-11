@@ -8,8 +8,8 @@ import type { ConfigForm, ConfigFormSnapshot } from '@deepseek-ai/dsh-client-ui-
 import type { Api, ApiResponse, RouteParams } from '../../src/app/api.ts'
 import { SKILL_NAME, SKILL_PREFIX, TEAM_SECTIONS, builtInBase, builtInPart, builtInParts, composePrompt, composeSkill, defaultPrompts,
   environmentSection, policySection, promptParts } from '../../src/app/prompts.ts'
-import type { DroppedReply, HistoryView, Problem, PromptsView, SetupView, SourceStatusRow, SourceView, StateView, ThreadPageView,
-  ThreadRow, TicketPageView,
+import type { DroppedReply, HistoryView, Problem, PromptsView, SetupView, SkillsView, SourceStatusRow, SourceView, StateView,
+  ThreadPageView, ThreadRow, TicketPageView,
   TicketRow, TicketStage,
   TriggerRow } from '../../src/client/api.ts'
 import { SETUP_FIELDS } from '../../src/deployment.ts'
@@ -89,6 +89,7 @@ export interface PanelServer {
   joinError?: string
   settings: Settings; revisions: Record<string, number>
   prompts: PromptsView
+  skills: SkillsView
   tickets: { open: TicketRow[]; ended: TicketRow[] }; ticketDetails: Record<string, TicketPageView>
   threads: ThreadRow[]
   threadPages: (key: string, query: { before?: string; around?: string }) => ThreadPageView | undefined
@@ -264,6 +265,12 @@ function initial(): PanelServer {
         summary: 'LlmError: no adapter registered for provider "provider-a"',
         note: { text: 'LlmError: no adapter registered for provider "provider-a"', error: true } }, { stage: 'person', action: 'failed' })],
     search: { items: [], threads: [] },
+    skills: {
+      packaged: [{ name: 'feishu', description: 'Feishu bot operations.', path: '/pkg/skills/dsh-superagent-feishu', active: true },
+        { name: 'github', description: 'GitHub repository operations.', path: '/pkg/skills/dsh-superagent-github', active: false }],
+      roots: [{ scope: 'user' as const, path: '/home/agent/.dsh/skills', exists: true, skills: [{ name: 'release', description: 'Release steps a person agreed on.' }] },
+        { scope: 'project' as const, path: '/srv/state/superagent/.dsh/skills', exists: false, skills: [] }],
+    },
     history: { current: 3, policyVersion: 'abcdef1234567890', items: [
       { revision: 4, savedAt: '2026-09-23T00:00:00Z', source: 'panel', policyVersion: '9876543210fedcba', policyChanged: true, notified: [],
         block: 'source:feishu',
@@ -373,6 +380,7 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
     groups: [{ id: 'worker-provider', name: 'Worker provider', models: [{ id: 'worker-model', name: 'Worker model',
       reasoning: { efforts: [{ id: 'high', name: 'High' }] } }] }] }) },
   'GET prompts': { query: ['revision', 'offset'], answer: () => server.prompts },
+  'GET skills': { answer: () => server.skills },
   'PUT prompts': { body: true, answer: ({ body }) => {
     const { revision } = server.prompts
     if (body.baseRevision !== revision) return refuse(409,

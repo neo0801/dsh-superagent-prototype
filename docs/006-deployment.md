@@ -198,6 +198,7 @@ Agents may rely on these routes and fields. The other routes in `src/app/api.ts`
 | `POST policy-sync/<source id>` | Syncs that Source's allowed list now: `policy`, the Source's part as saved |
 | `GET prompts`, `PUT prompts` with `{"config", "baseRevision"}` | Reads the prompt configuration: `current`, with its `revision` and `config`, `defaults`, `sections`, the team sections in the order Sessions read them, `skillName`, the pattern of a team skill's name, `builtin`, the names a team skill cannot take, and `skillPrefix`, which Sessions load a skill's name under. Or saves it: the new `revision` |
 | `POST tickets/<id>/retry`, `POST tickets/<id>/stop` | Retries or stops a Ticket, as the panel does |
+| `GET skills` | Reads the skills a Session can load, for the panel's Skills group: `packaged`, each packaged Source skill with its `description`, the bundle `path` that is a loaded skill's resource base, and whether this deployment registers it (`active`); and `roots`, each directory a Session scans with its `scope` (`user`, `project` or `ticket`), the container `path`, whether it `exists`, and the `skills` found there now, as `name` and `description` |
 
 Health entries are grouped by responsibility:
 

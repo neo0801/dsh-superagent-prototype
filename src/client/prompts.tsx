@@ -1,7 +1,7 @@
 /** Prompts settings group: section/skill editor, full composed prompt preview with diffing, and revision history. */
 import { Fragment, useCallback, useEffect, useState, type FormEvent, type ReactNode } from 'react'
 import type { ApiResponse } from '../app/api.ts'
-import type { PromptConfig, PromptsView } from './api.ts'
+import type { PromptConfig, PromptsView, SkillsView } from './api.ts'
 import { SaveBar, useDraft, type DraftWords } from './draft.tsx'
 import { changedSections, isPart, isSkill, lineDiff, partKey, partText, partWith, sectionLabel, sectionText, skillNameFree, withOverride,
   withOverrides, withSection, withoutSkill, type BuiltInPart, type DiffLine } from './prompt-config.ts'
@@ -71,9 +71,17 @@ function PromptSections({ config, view, changed, selected, onSelect, onEdit }: {
   config: PromptConfig; view: PromptsView; changed: string[]; selected: string; onSelect: (name: string) => void
   onEdit: (next: PromptConfig, note?: PromptNote) => void
 }) {
-  const { t } = usePanel()
+  const { t, call } = usePanel()
   const [name, setName] = useState('')
   const [invalid, setInvalid] = useState(false)
+  const [skills, setSkills] = useState<SkillsView>()
+  // The packaged skills this deployment registers, and what the directories a Session scans hold now.
+  useEffect(() => {
+    let live = true
+    call('GET skills').then(next => { if (live) setSkills(next) }, () => undefined)
+    return () => { live = false }
+  }, [call])
+  const packaged = new Map((skills?.packaged ?? []).map(skill => [skill.name, skill.active]))
   const item = (section: string, children: ReactNode) => <button key={section} type="button" className="dt-nav-item"
     aria-current={section === selected ? 'true' : undefined} onClick={() => onSelect(section)}>{children}</button>
   const unsaved = (section: string) => changed.includes(section) && <span className="dt-changed-dot" aria-label={t('unsaved')} />
@@ -93,10 +101,17 @@ function PromptSections({ config, view, changed, selected, onSelect, onEdit }: {
           className="dt-changed-tag">{t('promptChanged')}</span>}{unsaved(section)}</span><small>{t(`promptPartHint.${section}`)}</small>
       </>))}
       <div className="dt-nav-group">{t('promptBuiltInGroup')}</div>
-      {view.parts.map(entry => item(`part/${entry.key}`, <span>{sectionLabel(t, view, `part/${entry.key}`)}
-        {config.overrides?.[entry.key] && <span className="dt-changed-tag">{t('promptChanged')}</span>}
-        {updated(config, entry) && <span className="dt-changed-tag dt-updated-tag">{t('promptDefaultUpdated')}</span>}
-        {unsaved(`part/${entry.key}`)}</span>))}
+      {view.parts.map(entry => {
+        const usable = entry.key.startsWith('skill/') ? packaged.get(entry.key.slice('skill/'.length)) : undefined
+        return item(`part/${entry.key}`, <>
+          <span>{sectionLabel(t, view, `part/${entry.key}`)}
+            {config.overrides?.[entry.key] && <span className="dt-changed-tag">{t('promptChanged')}</span>}
+            {updated(config, entry) && <span className="dt-changed-tag dt-updated-tag">{t('promptDefaultUpdated')}</span>}
+            {unsaved(`part/${entry.key}`)}</span>
+          {usable !== undefined && <em className={usable ? 'dt-skill-tag' : 'dt-skill-tag dt-skill-tag-off'}>
+            {t(usable ? 'promptSkillActive' : 'promptSkillUnused')}</em>}
+        </>)
+      })}
       <div className="dt-nav-group">{t('promptSkillsGroup')}</div>
       {Object.keys(config.skills).map(skill => item(`skill/${skill}`, <span>{sectionLabel(t, view, `skill/${skill}`)}{unsaved(
         `skill/${skill}`)}</span>))}
@@ -106,6 +121,16 @@ function PromptSections({ config, view, changed, selected, onSelect, onEdit }: {
         {invalid && <p className="dt-error" role="alert">{t('promptSkillNameInvalid')}</p>}
         <Button variant="ghost" size="sm" type="submit" icon={<Icon name="plus" />}>{t('promptAddSkillAction')}</Button>
       </form>
+      {skills && <div className="dt-skill-roots">
+        <div className="dt-nav-group">{t('promptSkillsOnDisk')}</div>
+        {skills.roots.map(root => <div key={root.path} className="dt-skill-root">
+          <code className="dt-skill-root-path">{root.path}</code>
+          {root.skills.length > 0
+            ? root.skills.map(skill => <div key={skill.name} className="dt-skill-row">
+              <span>{skill.name}</span><small>{skill.description}</small></div>)
+            : <small>{t(root.exists ? 'promptSkillsNone' : 'promptSkillsNoRoot')}</small>}
+        </div>)}
+      </div>}
     </nav>
     {part ? <BuiltInEditor config={config} view={view} part={part} onEdit={onEdit} />
       : <TeamEditor config={config} view={view} selected={selected} onSelect={onSelect} onEdit={onEdit} />}

@@ -60,6 +60,19 @@ it('shows a built-in skill with the CLI notes in the full prompt, editable as a 
   expect(all('.dt-nav-item').map(item => item.textContent)).toContain('dsh-superagent-testing')
 })
 
+it('marks which packaged skill this deployment registers and lists the skills the scanned roots hold', async () => {
+  at({ page: 'settings', query: { group: 'prompts' } })
+  await mount()
+  const tagOf = (label: string) => all('.dt-nav-item').find(item => item.textContent?.startsWith(label))
+    ?.querySelector('.dt-skill-tag')?.textContent
+  expect(tagOf(zh['promptPart.skill/feishu'])).toBe(zh.promptSkillActive)
+  expect(tagOf(zh['promptPart.skill/github'])).toBe(zh.promptSkillUnused)
+  // The roots are the paths a Session scans, each with what it holds now.
+  expect(all('.dt-skill-root-path').map(path => path.textContent)).toEqual(['/home/agent/.dsh/skills', '/srv/state/superagent/.dsh/skills'])
+  expect(text()).toContain('release')
+  expect(text()).toContain(zh.promptSkillsNoRoot)
+})
+
 it('loads all defaults into the draft from the history without saving them', async () => {
   server.prompts.current = promptVersion(0, { ...defaultPrompts(), scope: 'Old scope' })
   at({ page: 'settings', query: { group: 'prompts' } })

@@ -135,6 +135,7 @@ export type TicketSummary = SearchView['tickets'][number]
 export type { TicketStage }
 export type HistoryView = ApiResponse<'GET policy/history'>
 export type PromptsView = ApiResponse<'GET prompts'>
+export type SkillsView = ApiResponse<'GET skills'>
 export type PromptConfig = PromptsView['defaults']
 export type ThreadFacts = TicketRow['threads'][number]
 export type Actor = TriggerRow['actor']

@@ -366,6 +366,14 @@ a.dt-btn, a.dt-btn:hover { text-decoration: none; }
 .dt-preview-head > span { font-size: 12px; color: var(--dsw-alias-label-caption); }
 .dt-changed-tag { margin-left: 6px; padding: 0 5px; border: 0.5px solid var(--dsw-alias-border-l3); border-radius: 4px; font-size: 11px; line-height: 16px; font-weight: 400; color: var(--dsw-alias-label-secondary); }
 .dt-updated-tag { border-color: var(--dsw-alias-state-warn-primary); color: var(--dsw-alias-state-warn-primary); }
+.dt-skill-tag { margin-left: 6px; padding: 0 5px; border: 0.5px solid var(--dsw-alias-border-l3); border-radius: 4px; font-size: 11px; line-height: 16px; font-style: normal; font-weight: 400; color: var(--dsw-alias-label-secondary); }
+.dt-skill-tag-off { border-style: dashed; color: var(--dsw-alias-label-caption); }
+.dt-skill-roots { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; padding-top: 8px; border-top: 0.5px solid var(--dsw-alias-border-l2); }
+.dt-skill-root { display: flex; flex-direction: column; gap: 2px; padding: 0 10px; }
+.dt-skill-root-path { font-size: 11px; line-height: 16px; color: var(--dsw-alias-label-caption); word-break: break-all; }
+.dt-skill-root small { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-caption); }
+.dt-skill-row { display: flex; flex-direction: column; gap: 1px; }
+.dt-skill-row > span { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-primary); }
 .dt-default-updated { display: flex; flex-direction: column; gap: 6px; padding: 2px 0 2px 12px; border-left: 2px solid var(--dsw-alias-state-warn-primary); }
 .dt-diff-fold { color: var(--dsw-alias-label-caption); font-style: italic; }
 .dt-compare { margin-left: auto; }
