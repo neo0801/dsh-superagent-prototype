@@ -475,7 +475,6 @@ const TEXT = {
   promptSkillActive: ['使用中', 'In use'],
   promptSkillUnused: ['未使用', 'Not in use'],
   promptSkillsNone: ['无技能', 'No skills'],
-  promptSkillsNoRoot: ['目录不存在', 'Folder does not exist'],
   'promptPartHint.communication': ['何时通知人、消息的写法、GitHub 首行声明、Review 的回复与 review bot', 'When to notify people, how messages read, the GitHub first line, review replies and review bots'],
   'promptPartHint.scope': ['工单何时继续、何时暂停并交草稿', 'When a Ticket goes on, and when it stops with a draft'],
   'promptPartHint.delivery': ['PR 证据、自动合并条件、提交作者', 'PR evidence, the auto-merge condition, the commit author'],

@@ -121,14 +121,14 @@ function PromptSections({ config, view, changed, selected, onSelect, onEdit }: {
         {invalid && <p className="dt-error" role="alert">{t('promptSkillNameInvalid')}</p>}
         <Button variant="ghost" size="sm" type="submit" icon={<Icon name="plus" />}>{t('promptAddSkillAction')}</Button>
       </form>
-      {skills && <div className="dt-skill-roots">
+      {skills && skills.roots.some(root => root.exists) && <div className="dt-skill-roots">
         <div className="dt-nav-group">{t('promptSkillsOnDisk')}</div>
-        {skills.roots.map(root => <div key={root.path} className="dt-skill-root">
+        {skills.roots.filter(root => root.exists).map(root => <div key={root.path} className="dt-skill-root">
           <code className="dt-skill-root-path">{root.path}</code>
           {root.skills.length > 0
             ? root.skills.map(skill => <div key={skill.name} className="dt-skill-row">
               <span>{skill.name}</span><small>{skill.description}</small></div>)
-            : <small>{t(root.exists ? 'promptSkillsNone' : 'promptSkillsNoRoot')}</small>}
+            : <small>{t('promptSkillsNone')}</small>}
         </div>)}
       </div>}
     </nav>
