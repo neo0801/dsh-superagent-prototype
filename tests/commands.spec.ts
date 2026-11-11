@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { z } from 'zod'
 import { CliError, Commands, commandError } from '../src/infra/commands.ts'
+import type { Deployment } from '../src/deployment.ts'
 import { feishuKind } from '../src/sources/feishu.ts'
 import { feishuChannel } from '../src/sources/feishu-trigger.ts'
 import { githubKind } from '../src/sources/github.ts'
@@ -158,6 +159,39 @@ describe('GitHub calls', () => {
     expect(tally).toEqual({ skipped: 1 })
     run.mockResolvedValue('{"message":"not a list"}')
     await expect(value.pages(z.looseObject({ id: z.number() }), 'issues/12/comments')).rejects.toThrow()
+  })
+})
+describe('GitLab calls', () => {
+  const gitlab = { cli: '/path/agent-gitlab', login: 'agent-bot', email: 'agent@example.com', project: 'acme/platform/widgets',
+    baseUrl: 'https://gitlab.example.com' }
+  const onGitLab: Deployment = { ...testDeployment(), repository: gitlab.project, github: undefined, gitlab }
+  const commands = () => new Commands(() => onGitLab, {}, new AbortController().signal)
+  const PROJECT = `/projects/${encodeURIComponent(gitlab.project)}`
+  it('go only to paths inside the configured project, and validate what GitLab answers', async () => {
+    const value = commands()
+    const run = vi.spyOn(value, 'run').mockResolvedValue('{"iid":12,"title":"Login fails","extra":true}')
+    expect(await value.gitlab(z.looseObject({ iid: z.number() }), `${PROJECT}/issues/12`))
+      .toEqual({ iid: 12, title: 'Login fails', extra: true })
+    expect(run).toHaveBeenLastCalledWith('/path/agent-gitlab', ['api', `${PROJECT}/issues/12`])
+    // Without a schema the first argument is the path itself, and the rest are flags.
+    run.mockResolvedValue('raw')
+    expect(await value.gitlab(`${PROJECT}/issues?state=opened`, '--method', 'GET')).toBe('raw')
+    expect(run).toHaveBeenLastCalledWith('/path/agent-gitlab', ['api', `${PROJECT}/issues?state=opened`, '--method', 'GET'])
+    for (const path of ['/projects/1/issues', '../../other/project/issues', 'https://gitlab.example.com/api/v4/x']) {
+      await expect(value.gitlab(z.unknown(), path)).rejects.toThrow('restricted to the configured project')
+      await expect(value.gitlab(path)).rejects.toThrow('restricted to the configured project')
+    }
+  })
+  it('read every page of a list until a short page, and skip and count an item that does not validate', async () => {
+    const value = commands()
+    const run = vi.spyOn(value, 'run')
+      .mockResolvedValueOnce(JSON.stringify(Array.from({ length: 100 }, (_, id) => ({ id }))))
+      .mockResolvedValueOnce(JSON.stringify([{ id: 100 }, { id: 'invalid' }]))
+    const tally = { skipped: 0 }
+    expect(await value.gitlabPages(z.looseObject({ id: z.number() }), `${PROJECT}/issues/12/notes?sort=asc`, tally)).toHaveLength(101)
+    expect(tally).toEqual({ skipped: 1 })
+    expect(run).toHaveBeenNthCalledWith(1, '/path/agent-gitlab', ['api', `${PROJECT}/issues/12/notes?sort=asc&per_page=100&page=1`])
+    expect(run).toHaveBeenNthCalledWith(2, '/path/agent-gitlab', ['api', `${PROJECT}/issues/12/notes?sort=asc&per_page=100&page=2`])
   })
 })
 it('says how to add the bot to a chat when Feishu answers that it is not a member, and keeps the code', async () => {

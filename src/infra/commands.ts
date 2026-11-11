@@ -98,16 +98,17 @@ export class Commands {
   async gitlab<T>(schema: z.ZodType<T>, path: string, ...flags: string[]): Promise<T>
   async gitlab(path: string, ...flags: string[]): Promise<string>
   async gitlab<T>(schema: z.ZodType<T> | string, ...rest: string[]): Promise<T | string> {
+    const cli = gitlabAccount(this.deployment).cli
+    // The path-only form takes the path as its first argument, so `rest` holds the flags only.
+    if (typeof schema === 'string') return this.run(cli, ['api', this.gitlabPath(schema), ...rest])
     const [path = '', ...flags] = rest
-    const output = await this.run(gitlabAccount(this.deployment).cli, ['api', this.gitlabPath(path), ...flags])
-    if (typeof schema === 'string') return output
-    return schema.parse(JSON.parse(output))
+    return schema.parse(JSON.parse(await this.run(cli, ['api', this.gitlabPath(path), ...flags])))
   }
   /** Fetches all pages of a GitLab API list within the configured project, skipping items that fail schema validation. */
   async gitlabPages<T>(item: z.ZodType<T>, path: string, tally?: Tally): Promise<T[]> {
     const items: T[] = []
     for (let page = 1; page <= 50; page += 1) {
-      const listed = z.array(z.unknown()).parse(await this.gitlab(`${path}${path.includes('?') ? '&' : '?'}per_page=100&page=${page}`))
+      const listed = await this.gitlab(z.array(z.unknown()), `${path}${path.includes('?') ? '&' : '?'}per_page=100&page=${page}`)
       items.push(...validItems(item, listed, tally))
       if (listed.length < 100) break
     }
