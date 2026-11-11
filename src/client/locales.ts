@@ -405,7 +405,7 @@ const TEXT = {
   modelEffort: ['推理强度（可选）', 'Reasoning effort (optional)'],
   modelInherit: ['继承 DSH 默认值', 'Inherit the DSH default'],
   modelEffortDefault: ['模型默认', 'Model default'],
-  modelCatalogError: ['无法加载模型建议，仍可填写已知的服务商和模型：{error}', 'Model suggestions are unavailable; known Provider and Model names still work: {error}'],
+  modelCatalogError: ['无法加载模型建议，仍可从列表选择或保留已保存的值：{error}', 'Model suggestions are unavailable; pick from the list or keep the saved value: {error}'],
   historyIntro: ['每次保存记一条；改变策略版本的保存（接单规则、各来源上的策略、接单模式）通知进行中的工单。', 'Each save is one entry; saves that change the Policy version (rules, the Policy on each Source, accept mode) notify open Tickets.'],
   historyItem: ['第 {revision} 次保存 · {source}', 'Save {revision} · {source}'],
   historyPolicyChanged: ['生成策略版本 {version}', 'New Policy version {version}'],

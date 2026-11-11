@@ -80,6 +80,22 @@ it('keeps a model saved before the catalogue changed selectable, and leaves it u
   expect(server.settings.eval.timeoutSeconds).toBe(180)
 })
 
+it('says the model suggestions are unavailable when the catalogue cannot be read, and still offers the saved value', async () => {
+  server.settings = { ...server.settings,
+    eval: { ...server.settings.eval, model: { provider: 'legacy-provider', model: 'legacy-model' } } }
+  server.modelsError = 'catalog is down'
+  onTestFinished(() => { server.modelsError = undefined })
+  await mount()
+  await click(zh['tab.eval'])
+  await click(find(zh['tab.settings'], '.dt-status-head button'))
+  // The pickers are lists, so the copy offers the list and the saved value rather than free typing.
+  expect(document.querySelector('.dt-model .dt-error')?.textContent)
+    .toBe(zh.modelCatalogError.replace('{error}', 'catalog is down'))
+  expect([field<HTMLSelectElement>(zh.modelProvider).value, field<HTMLSelectElement>(zh.modelName).value])
+    .toEqual(['legacy-provider', 'legacy-model'])
+  expect([...field<HTMLSelectElement>(zh.modelProvider).options].map(option => option.value)).toEqual(['', 'legacy-provider'])
+})
+
 it('loads configuration history on demand with localized changes, Source field labels and notified Tickets', async () => {
   server.history = { current: 3, policyVersion: 'abcdef1234567890', items: [{ revision: 3, savedAt: '2026-09-22T00:00:00Z',
     source: 'sync', policyVersion: 'abcdef1234567890', policyChanged: true, notified: [{ id: 't1', title: '修复回归' }], block: 'policy',
