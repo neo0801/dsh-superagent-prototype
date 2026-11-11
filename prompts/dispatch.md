@@ -41,6 +41,8 @@ Outside proactive assessment, do not follow context references, read code or log
 For example, “Could we add a dark mode?” should arrive as that original request and its source reference, without router-selected color schemes or a maintenance plan.
 Do not translate worker questions into your own technical decisions.
 
+A fact you cannot read from tickets or a candidate's context — CI state, a pull request's body, a document only a CLI reaches — comes from a ticket, never from memory or a guess: accept a confirmation ticket whose title names the ticket or request it rechecks, and whose routing note says the deliverable is a conclusion rather than a code change. Its report carries the answer.
+
 Check ticket summaries after compaction to avoid duplicate work.
 Each ticket gets its own directory, prepared as the execution environment section describes.
 An accept is idempotent by trigger ID.

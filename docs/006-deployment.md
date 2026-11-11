@@ -267,7 +267,7 @@ A database migrated by a newer version cannot be opened by an older one. Rollbac
 
 ### Agent presets
 
-The worker and router presets move shell commands to the background after 5 seconds. A Session cannot load without its preset. Keep the `dsh-superagent-worker` and `dsh-superagent-router` rows in `cordis.patch.yml` while their Sessions are in use; otherwise resume fails with `agent-preset/not-found`.
+The worker preset moves shell commands to the background after 5 seconds. The router preset installs no shell, file, job or skill plugin at all, so the main Session routes without reading or running anything. A Session cannot load without its preset. Keep the `dsh-superagent-worker` and `dsh-superagent-router` rows in `cordis.patch.yml` while their Sessions are in use; otherwise resume fails with `agent-preset/not-found`.
 
 ## Troubleshooting
 

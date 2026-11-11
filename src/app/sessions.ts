@@ -42,7 +42,7 @@ export interface SessionsHost {
  * What Sessions registered for an agent it decorated: the releases of its prompt section, tools and skill scope, the scope
  * its skills are registered in, and the skills of one prompt revision; for a worker's subagent, only its tool limits.
  */
-interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: { revision: number; dispose: () => void }; subagent?: true }
+interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: { revision: number; dispose: () => void }; subagent?: true; noSkills?: true }
 
 /** The agent presets Executor Sessions and the main Session are created with, which the bundle's patch defines. */
 export const WORKER_PRESET = 'dsh-superagent-worker', ROUTER_PRESET = 'dsh-superagent-router'
@@ -60,8 +60,6 @@ declare module '@deepseek-ai/cordis' {
  */
 const WORK_TOOLS = ['read', 'write', 'edit', 'read_image', 'glob', 'grep', 'bash', 'pwsh', 'job_output', 'job_list', 'job_kill', 'web_search',
   'web_fetch', 'skill', 'todo_write', 'subagent', 'list_subagent_models', 'send_message', 'list_agents', 'interrupt_agent']
-/** The shell tool the running profile exposes: DSH registers bash on POSIX and pwsh on Windows. */
-const SHELL_TOOL: 'bash' | 'pwsh' = process.platform === 'win32' ? 'pwsh' : 'bash'
 /**
  * The scope key DSH holds for one Agent. `agent.ctx` does not always carry it: DSH resolves a service such as `tools`
  * through a scoped instance, so the service's own context is the reliable carrier of the Agent's scope key.
@@ -82,9 +80,9 @@ const DEFAULT_WAIT = 'This shell waits up to 60 seconds by default: pass timeout
 const SLEEP = /(?:^|[;&|({!`\n]|\b(?:do|then|else|elif|if|while|until|time|exec|nohup|command|env)\s)\s*(?:\S*\/)?sleep\b/
 /**
  * The main Session's guard: it refuses a bash command that runs sleep or asks to hold the step longer than 30 seconds, and a
- * job wait longer than 5 seconds. Under `standard`, as a main Session created before the router preset runs, the shell holds
- * a command 60 seconds and a job wait lasts 30 seconds by default, so a command needs a timeout or the background, and a
- * job wait its timeout; the router preset ends both after 5 seconds.
+ * job wait longer than 5 seconds. The router preset installs no shell or job tool, so this only bites on a main Session that
+ * still runs `standard` before the router preset applies, where the shell holds a command 60 seconds and a job wait lasts 30
+ * seconds by default: a command then needs a timeout or the background, and a job wait its own timeout.
  */
 function noWait({ name, arguments: input }: { name: string; arguments: unknown }, routed: () => boolean): string | undefined {
   const args = (input ?? {}) as { command?: unknown; timeoutMs?: unknown; run_in_background?: unknown; wait?: unknown; timeout_ms?: unknown }
@@ -248,6 +246,7 @@ export class Sessions {
     const ticket = master ? undefined : this.ticketOf(agent)
     if (!master && !ticket) { this.limitSubagent(agent); return }
     const binding: SessionBinding = { disposers: [] }
+    if (master) binding.noSkills = true
     this.bindings.set(agent, binding)
     this.retryHealth.restore(agent.id, agent.session.snapshotEvents())
     if (agent.status === 'idle') this.retryHealth.clear(agent.id)
@@ -259,10 +258,12 @@ export class Sessions {
       const composed = host.prompts.compose(version.config, master ? 'orchestrator' : 'worker', current ? host.environment(current) : undefined)
       return `[dsh-superagent prompt revision ${version.revision}]\n${composed}\n${current ? mandateInstructions(current.mandate) : ''}`
     }, ...(master ? { complete: true } : {}) }))
-    // A recreated skill scope (e.g. after the skills service restarts) starts empty, so reset `binding.skills` before rebinding.
+    // The main Session loads no skills: with no skill tool, a scope would register skills it cannot load. Its scope is still
+    // awaited, so decoration keeps one asynchronous step rather than resolving early for the Session that routes.
     const skillScope = agent.ctx.inject(['skills'], scope => {
       binding.scope = scope
       binding.skills = undefined
+      if (master) return
       this.bindSkills(binding, host.prompts.current())
     })
     binding.disposers.push(() => { skillScope.dispose().catch((error: unknown) => { this.ctx.logger.warn('dsh-superagent could not release a skill scope: %s', String(error)) }) })
@@ -272,7 +273,9 @@ export class Sessions {
     const register = this.registerTool(agent, binding)
     for (const tool of host.tools(agent, ticket)) register(tool.name, tool.description, tool.schema, tool.execute)
     if (master) {
-      binding.disposers.push(agent.ctx.tools.restrict({ allow: ['skill', SHELL_TOOL, 'read', 'read_image', 'job_output', 'job_list', 'job_kill'] }),
+      // Mask every tool the preset inherits; the routing tools registered just above sit on this Session's own layer and stay.
+      // A main Session that still runs `standard` before the router preset applies would otherwise inherit that preset's work tools.
+      binding.disposers.push(agent.ctx.tools.restrict({ allow: [] }),
         agent.ctx.tools.guard(execution => noWait(execution, () => this.routed(agent))))
     } else {
       // An Executor Session keeps the profile's work tools it has, which DSH requires to be known; its own tools are not masked.
@@ -330,7 +333,7 @@ export class Sessions {
   /** Register the skills of a prompt version in the agent's skill scope, in place of an earlier version's. */
   private bindSkills(binding: SessionBinding, version: PromptVersion): void {
     const { scope, skills: previous } = binding
-    if (!scope || previous?.revision === version.revision) return
+    if (!scope || binding.noSkills || previous?.revision === version.revision) return
     previous?.dispose()
     const disposers: (() => void)[] = []
     for (const [name, content] of this.host.prompts.skills(version.config)) {

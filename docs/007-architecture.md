@@ -511,13 +511,13 @@ The main Session has 14 application tools:
 
 Settings saves select `policy`, `eval`, `executor`, `pause`, or `source`; the last also names its Source id. A prompt save with `preview: true` composes text without saving.
 
-The main Session also has DeepSeek Harness's `skill`, `bash`, `read`, `read_image`, `job_output`, `job_list` and `job_kill`. Avoiding code reads is a prompt rule, not a tool restriction.
+The main Session has none of DeepSeek Harness's work tools: its preset installs no shell, file, job or skill plugin, and `Sessions` masks every inherited tool for it as well. It calls only the application tools it registers on its own Session, so a code read or a command is impossible rather than forbidden. A fact those tools cannot read, such as CI state or a document behind a CLI, comes from a confirmation ticket accepted for that purpose.
 
 ### Presets and wait limits
 
-New main Sessions use `dsh-superagent-router` (`ROUTER_PRESET`). Shell commands and job waits return after 5 seconds. If the Web UI selects another preset before the first turn, `Sessions` restores this preset, or `WORKER_PRESET` for a worker.
+New main Sessions use `dsh-superagent-router` (`ROUTER_PRESET`), which installs only context management: the repository instructions, the time context and compaction. If the Web UI selects another preset before the first turn, `Sessions` restores this preset, or `WORKER_PRESET` for a worker.
 
-The `noWait` guard in `src/app/sessions.ts` refuses main-Session shell commands that invoke `sleep` at a command position, shell `timeoutMs` above 30 seconds, and `job_output` waits above 5 seconds. Reports and job results arrive automatically, so waiting only delays incoming candidates.
+The `noWait` guard in `src/app/sessions.ts` refuses main-Session shell commands that invoke `sleep` at a command position, shell `timeoutMs` above 30 seconds, and `job_output` waits above 5 seconds. The router preset gives the main Session no shell or job tool, so the guard now covers only a main Session that still runs `standard`, kept as a second line of defence. Reports and job results arrive automatically, so waiting only delays incoming candidates.
 
 Existing main Sessions on `standard` also need explicit timeouts for foreground commands and job waits; otherwise that preset's defaults hold the step for 60 and 30 seconds respectively. The host determines the current preset through `presetForSession`, falls back to the Session projection or header, and assumes `standard` if it cannot read the value.
 

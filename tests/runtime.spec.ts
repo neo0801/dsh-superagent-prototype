@@ -1555,12 +1555,14 @@ it('reads the main Session\'s preset from a registry with or without presetForSe
   expect(main(watch)).toMatch(/^This shell waits up to 60 seconds by default/)
 })
 
-it('refuses an ended ticket\'s worker its tools, and restricts the main Session to the tools it may use', async () => {
+it('refuses an ended ticket\'s worker its tools, and masks every inherited tool from the main Session', async () => {
   const { ticket, sessionId } = await acceptedTicket()
   expect(guards.get(sessionId)!()).toBeUndefined()
   runtime.engine.stopTicket(ticket.id)
   expect(guards.get(sessionId)!()).toBe('Ticket ended; new work needs a new authorized ticket')
-  expect(restricts.get(runtime.masterId)).toEqual([{ allow: ['skill', 'bash', 'read', 'read_image', 'job_output', 'job_list', 'job_kill'] }])
+  // The main Session works through the tools dsh-superagent registers on its own layer; the empty allow list masks whatever its
+  // preset inherits, so a Session that still runs `standard` gets no work tool either.
+  expect(restricts.get(runtime.masterId)).toEqual([{ allow: [] }])
   // A worker keeps only the profile's work tools: none that ask a person, change the profile, schedule or start work outside
   // the worker slots, reach other Sessions or edit documents, whenever they were registered.
   expect(restricts.get(sessionId)).toEqual([{ allow: ['read', 'read_image', 'grep', 'bash', 'job_output', 'job_list', 'job_kill', 'web_search', 'skill'] }])

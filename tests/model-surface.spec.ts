@@ -258,7 +258,9 @@ function collect(host: Host, { a, b, workerA, workerB, refusal }: Awaited<Return
       surfaces.push({ where: `${role} tool ${tool.name}`, owner: TOOLS, role, text: descriptions.join('\n') })
     }
   }
-  for (const { name, description, content } of host.skills.get(runtime.masterId)!) {
+  // Skills register in worker Sessions only: the main Session's preset installs no skill tool. Their text still describes both
+  // roles, as `cli.md` does when it leaves other reads to workers and routing to the main Session, so it is tagged `both`.
+  for (const { name, description, content } of host.skills.get(workerA)!) {
     surfaces.push({ where: `skill ${name}`, owner: PROMPTS, role: 'both', text: `${description}\n${content}` })
   }
   surfaces.push({ where: 'orchestrator tool orchestrator_reply error', owner: ERRORS, role: 'orchestrator', text: refusal })
@@ -353,6 +355,8 @@ it('collects both roles\' tools, prompts, skills and inputs', () => {
     'orchestrator_thread_follow',
     'orchestrator_thread_unrelated', 'orchestrator_trigger_handback'])
   expect([...toolsOf('orchestrator').keys()]).toEqual(expect.arrayContaining(['orchestrator_route', 'orchestrator_eval_decide', 'orchestrator_reply']))
+  // The main Session loads no skills: its preset has no skill tool, so the host registers none for it.
+  expect(host.skills.get(host.runtime.masterId)).toEqual([])
   // The one routing tool takes the place of four.
   for (const name of ['orchestrator_ticket_accept', 'orchestrator_ticket_attach', 'orchestrator_ticket_stop', 'orchestrator_trigger_ignore']) {
     expect(toolsOf('orchestrator').has(name)).toBe(false)

@@ -26,7 +26,7 @@ Each Ticket gets an Executor Session named `worker-<ticket id>` and a directory 
 
 Executor Sessions run commands without approval as the operator's OS user. Their `dsh-superagent-worker` preset contains the tools needed for work and moves foreground shell commands to background jobs after 5 seconds. This lets a worker receive new messages at the next step instead of waiting for a long command to finish.
 
-The main Session uses `dsh-superagent-router`, with the same 5-second shell and job-wait limits and a smaller tool set for routing. Sessions retain the preset selected at creation. Worker subagents use DeepSeek Harness's `standard` preset.
+The main Session uses `dsh-superagent-router`, whose preset installs no work tool at all: no shell, file, job or skill plugin. It calls only the tools dsh-superagent registers on its own Session — routing, candidate assessment, replies and settings — with context management beside them. A fact those tools cannot read comes from a confirmation ticket. Sessions retain the preset selected at creation. Worker subagents use DeepSeek Harness's `standard` preset.
 
 ### Background work and worker slots
 
