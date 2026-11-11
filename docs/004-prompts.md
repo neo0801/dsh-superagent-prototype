@@ -56,8 +56,6 @@ A bundle is installed by committing it to the repository, so the change that add
 | Never | credential files, the deployment's state directory, another repository, or another account's material |
 | Tools | the same tools and sandbox as the Executor that loads it; a bundle cannot widen either, and listing one adds no network access, rule or Mandate |
 
-An installer that would fetch a bundle and judge it automatically is not part of this version. If one is added, a bundle that breaks the table above must not be installed on a check's own verdict: the check reports, and installing past a violation takes a person's explicit answer to continue, recorded with the findings it overrode.
-
 ## Assembly and precedence
 
 The system prompt is assembled in this order:
