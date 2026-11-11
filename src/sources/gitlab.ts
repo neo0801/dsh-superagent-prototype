@@ -329,9 +329,13 @@ async function pollStream(ctx: SourceContext, round: Round, stream: 'issues' | '
       if (sameName(item.author.username, gitlab.login)) continue
       const target = stream === 'issues' ? 'issue' as const : 'merge_request' as const
       round.read.add(threadId(target, item.iid))
-      const trigger = stream === 'issues' ? issueTrigger(item as GitlabIssue, gitlab.login) : mergeRequestTrigger(item as GitlabMergeRequest, gitlab.login)
-      // An item whose notes changed is read again with the same Trigger ID, which the Engine deduplicates.
-      if (await ctx.receive(trigger) !== 'duplicate') round.received += 1
+      // Only an item created since the stream's cursor brings its body as a Trigger; a later edit or comment on an older one
+      // is read as notes, so stale text cannot become a request in its original author's name (the GitHub Source does the same).
+      if (fresh(item.created_at, since)) {
+        const trigger = stream === 'issues' ? issueTrigger(item as GitlabIssue, gitlab.login) : mergeRequestTrigger(item as GitlabMergeRequest, gitlab.login)
+        // An item whose notes changed is read again with the same Trigger ID, which the Engine deduplicates.
+        if (await ctx.receive(trigger) !== 'duplicate') round.received += 1
+      }
       await pollNotes(ctx, round, { iid: item.iid, target, url: item.web_url, since })
       nameThread(ctx, item.iid, target, item.title, item.web_url)
     }

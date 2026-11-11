@@ -162,13 +162,14 @@ describe('gitlab polling', () => {
   /** A SourceContext whose only real part is the GitLab CLI reads, which the test routes by path. */
   function sourceContext(routes: { issues?: unknown[]; mergeRequests?: unknown[]; notes?: unknown[] }, overrides: Partial<SourceContext> = {}) {
     const received: Trigger[] = []
+    const asked: string[] = []
     const state = new Map<string, unknown>()
     const reported: unknown[] = []
     const base = {
       deployment: testDeployment({ repository: project, gitlab }),
       commands: { deployment: testDeployment({ repository: project, gitlab }),
-        gitlabPages: vi.fn(async (_schema: unknown, path: string) => path.includes('/notes') ? (routes.notes ?? [])
-          : path.includes('/merge_requests') ? (routes.mergeRequests ?? []) : (routes.issues ?? [])),
+        gitlabPages: vi.fn(async (_schema: unknown, path: string) => { asked.push(path); return path.includes('/notes') ? (routes.notes ?? [])
+          : path.includes('/merge_requests') ? (routes.mergeRequests ?? []) : (routes.issues ?? []) }),
         gitlab: vi.fn(async () => ({ default_branch: 'main' })) } as unknown as Commands,
       ready: Promise.resolve(), configured: () => true, config: () => config(),
       receive: (trigger: Trigger) => { received.push(trigger); return { status: 'received' } },
@@ -181,21 +182,28 @@ describe('gitlab polling', () => {
       triggers: { get: () => undefined, latest: () => undefined },
       notify: () => {}, report: (_entry: string, value: unknown) => { reported.push(value) }, ...overrides,
     }
-    return { context: base as unknown as SourceContext, received, state, reported }
+    return { context: base as unknown as SourceContext, received, asked, state, reported }
   }
   it('receives an Issue and its new notes, skipping system notes and notes the agent wrote itself', async () => {
     const now = new Date().toISOString()
-    const routes = { issues: [{ ...issue, updated_at: now }, { ...issue, iid: 9, updated_at: '2026-06-01T00:00:00Z' }],
+    const routes = { issues: [{ ...issue, created_at: now, updated_at: now },
+      // Created before the cursor and edited now: its notes are read, but the stale body is not sent again as a request.
+      { ...issue, iid: 6, updated_at: now },
+      { ...issue, iid: 9, updated_at: '2026-06-01T00:00:00Z' }],
       notes: [note(1, '@agent-bot take this', 'alice', { created_at: now }), note(2, 'label added', 'alice', { system: true }),
         note(3, 'the agent wrote this', 'agent-bot'), note(4, 'no mention', 'carol', { created_at: now })] }
-    const { context, received, state } = sourceContext(routes)
+    const { context, received, asked, state } = sourceContext(routes)
     // A cursor older than the poll horizon is clamped to it, so Issue 9 (outside the horizon) is not read.
     state.set(KV.gitlab.stream('issues'), { since: '2026-01-01T00:00:00.000Z' })
     await pollRound(context)
     expect(received.map(trigger => trigger.meta.kind)).toEqual(['issue', 'note', 'note'])
+    expect(received[0]).toMatchObject({ meta: { kind: 'issue', iid: 7 } })
     expect(received[1]).toMatchObject({ addressed: 'mention', human: true, meta: { noteId: 1, target: 'issue', iid: 7 } })
     expect(received[2]).toMatchObject({ human: true, meta: { noteId: 4 } })
     expect(received[2]).not.toHaveProperty('addressed')
+    // Issue 6 was read for its notes even though its body produced no Trigger.
+    expect(asked.some(path => path.includes('/issues/6/notes'))).toBe(true)
+    expect(received.some(trigger => trigger.meta.iid === 6)).toBe(false)
     // Both stream cursors advance, and a clean round reports ready.
     expect(state.get(KV.gitlab.stream('issues'))).toMatchObject({ since: expect.any(String) })
     expect(state.get(KV.gitlab.stream('merge_requests'))).toMatchObject({ since: expect.any(String) })
