@@ -13,7 +13,8 @@ type Headers = Record<string, string | undefined>
 function serve(runtime: Partial<Record<keyof HttpHost, unknown>>, host = '127.0.0.1') {
   let handler: Handler = async () => {}
   const ctx = { webServer: { host, port: 3082, register: (route: { handler: Handler }) => { handler = route.handler; return () => {} } } }
-  registerHttp(ctx as never, { ready: Promise.resolve(), ...runtime } as unknown as HttpHost)
+  const machine = { managementHost: '127.0.0.1', ...(runtime.machine as Record<string, unknown> | undefined ?? {}) }
+  registerHttp(ctx as never, { ready: Promise.resolve(), ...runtime, machine } as unknown as HttpHost)
   return async (method: string, path: string, body?: unknown, headers: Headers = {}) => {
     let status = 0, text = ''
     const chunks = body === undefined ? [] : [Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))]
@@ -76,8 +77,20 @@ it('answers only a same-origin request from the panel on the loopback address', 
       body: { error: 'Same-origin management request required' } })
   }
   expect(await post({ host: 'localhost:3082', origin: 'http://localhost:3082' })).toMatchObject({ status: 200 })
-  // Management routes require a loopback Web server.
+  // Management routes require a loopback Web server unless the profile names another management host.
   expect(() => serve({}, '0.0.0.0')).toThrow('Orchestrator management requires a loopback Web server')
+})
+
+it('answers panel requests on a management host the profile names explicitly', async () => {
+  const call = serve({ sessions: { delivery: async () => 'injected' }, engine: { unsubscribe: () => true },
+    machine: { managementHost: '10.4.23.66' } }, '10.4.23.66')
+  const post = (host: string) => call('POST', 'threads/github%3A1/unsubscribe', undefined, { host })
+  expect(await post('10.4.23.66:3082')).toMatchObject({ status: 200 })
+  // A management host accepts only its own address; loopback is neither required nor accepted there.
+  expect(await post('127.0.0.1:3082')).toEqual({ status: 403, body: { error: 'Same-origin management request required' } })
+  expect(() => serve({}, '10.4.23.66')).toThrow('Orchestrator management requires a loopback Web server')
+  expect(() => serve({ machine: { managementHost: '10.4.23.66' } }, '127.0.0.1'))
+    .toThrow('Orchestrator management requires a Web server bound to the management host 10.4.23.66')
 })
 
 it('answers a prompt save that lost a race with 409, and a settings body over 128 KiB with 400', async () => {
