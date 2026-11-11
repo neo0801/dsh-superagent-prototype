@@ -29,8 +29,8 @@ it('saves the Eval block on the Policy settings and the Executor with its execut
   await click(find(zh['tab.settings'], '.dt-status-head button'))
   await click(zh['mode.auto'])
   await type(field<HTMLInputElement>(zh.evalTimeout), '180')
-  const [provider, model] = all('.dt-model input')
-  await type(provider as HTMLInputElement, 'worker-provider'); await type(model as HTMLInputElement, 'worker-model')
+  await type(field<HTMLSelectElement>(zh.modelProvider), 'worker-provider')
+  await type(field<HTMLSelectElement>(zh.modelName), 'worker-model')
   await click(zh.save)
   expect(server.settings.eval).toEqual({ mode: 'auto', timeoutSeconds: 180, model: { provider: 'worker-provider', model: 'worker-model' } })
   await click(find(zh['promptPart.runtime/work'], '.dt-settings-link'))
@@ -48,16 +48,36 @@ it('saves the Eval block on the Policy settings and the Executor with its execut
   await click('DSH_SUPERAGENT_DIR')
   expect(field<HTMLTextAreaElement>(zh.prepareCommand).value).toBe('git worktree add "$DSH_SUPERAGENT_DIR"')
   await type(field<HTMLInputElement>(zh.blockedCommands), 'gh-personal  gh.other')
-  const [workerProvider, workerModel, effort] = all('.dt-model input')
-  await type(workerProvider as HTMLInputElement, 'worker-provider'); await type(workerModel as HTMLInputElement,
-    'worker-model'); await type(effort as HTMLInputElement, 'high')
-  expect([...document.querySelectorAll('#dt-worker-model-efforts option')].map(option => option.getAttribute('value'))).toEqual(['high'])
+  await type(field<HTMLSelectElement>(zh.modelProvider), 'worker-provider')
+  await type(field<HTMLSelectElement>(zh.modelName), 'worker-model')
+  const effort = field<HTMLSelectElement>(zh.modelEffort)
+  // The effort list comes from the catalogue entry the Provider and Model name, so it appears once both are picked.
+  expect([...effort.options].map(option => option.getAttribute('value'))).toEqual(['', 'high'])
+  await type(effort, 'high')
   await click(zh.save)
   expect(server.settings.executor).toEqual({ maxWorkers: 5, directory: '/srv/work',
     prepare: 'git worktree add "$DSH_SUPERAGENT_DIR"', blockedCommands: ['gh-personal', 'gh.other'], model: { provider: 'worker-provider',
       model: 'worker-model', reasoningEffort: 'high' } })
   expect(server.requests.filter(request => request.method === 'PUT').map(request => request.path)).toEqual(['settings/eval',
     'settings/executor'])
+})
+
+it('keeps a model saved before the catalogue changed selectable, and leaves it unchanged while another field is edited', async () => {
+  server.settings = { ...server.settings,
+    eval: { ...server.settings.eval, model: { provider: 'legacy-provider', model: 'legacy-model', reasoningEffort: 'legacy-effort' } } }
+  await mount()
+  await click(zh['tab.eval'])
+  await click(find(zh['tab.settings'], '.dt-status-head button'))
+  const [provider, model, effort] = [field<HTMLSelectElement>(zh.modelProvider), field<HTMLSelectElement>(zh.modelName),
+    field<HTMLSelectElement>(zh.modelEffort)]
+  // A value the catalogue no longer offers stays selectable, so opening the form cannot silently rewrite it.
+  expect([provider, model, effort].map(select => [...select.options].map(option => option.getAttribute('value'))))
+    .toEqual([['', 'worker-provider', 'legacy-provider'], ['', 'legacy-model'], ['', 'legacy-effort']])
+  expect([provider.value, model.value, effort.value]).toEqual(['legacy-provider', 'legacy-model', 'legacy-effort'])
+  await type(field<HTMLInputElement>(zh.evalTimeout), '180')
+  await click(zh.save)
+  expect(server.settings.eval.model).toEqual({ provider: 'legacy-provider', model: 'legacy-model', reasoningEffort: 'legacy-effort' })
+  expect(server.settings.eval.timeoutSeconds).toBe(180)
 })
 
 it('loads configuration history on demand with localized changes, Source field labels and notified Tickets', async () => {
