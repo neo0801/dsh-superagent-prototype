@@ -3,7 +3,7 @@ import { execFile } from 'node:child_process'
 import { basename } from 'node:path'
 import { promisify } from 'node:util'
 import { z } from 'zod'
-import { githubAccount, type Deployment } from '../deployment.ts'
+import { githubAccount, gitlabAccount, type Deployment } from '../deployment.ts'
 
 const exec = promisify(execFile)
 const TIMEOUT_MS = 90_000
@@ -90,6 +90,33 @@ export class Commands {
   async pages<T>(item: z.ZodType<T>, path: string, tally?: Tally): Promise<T[]> {
     const pages = z.array(z.array(z.unknown())).parse(await this.gh(['api', this.path(path), '--paginate', '--slurp']))
     return validItems(item, pages.flat(), tally)
+  }
+  /**
+   * Calls the GitLab API through the agent's GitLab CLI, restricted to the configured project, and parses its JSON output
+   * (or returns raw output when no schema is given).
+   */
+  async gitlab<T>(schema: z.ZodType<T>, path: string, ...flags: string[]): Promise<T>
+  async gitlab(path: string, ...flags: string[]): Promise<string>
+  async gitlab<T>(schema: z.ZodType<T> | string, ...rest: string[]): Promise<T | string> {
+    const [path = '', ...flags] = rest
+    const output = await this.run(gitlabAccount(this.deployment).cli, ['api', this.gitlabPath(path), ...flags])
+    if (typeof schema === 'string') return output
+    return schema.parse(JSON.parse(output))
+  }
+  /** Fetches all pages of a GitLab API list within the configured project, skipping items that fail schema validation. */
+  async gitlabPages<T>(item: z.ZodType<T>, path: string, tally?: Tally): Promise<T[]> {
+    const items: T[] = []
+    for (let page = 1; page <= 50; page += 1) {
+      const listed = z.array(z.unknown()).parse(await this.gitlab(`${path}${path.includes('?') ? '&' : '?'}per_page=100&page=${page}`))
+      items.push(...validItems(item, listed, tally))
+      if (listed.length < 100) break
+    }
+    return items
+  }
+  private gitlabPath(path: string): string {
+    const project = encodeURIComponent(gitlabAccount(this.deployment).project)
+    if (!path.startsWith(`/projects/${project}`)) throw new Error('GitLab calls are restricted to the configured project')
+    return path
   }
   private path(path: string): string {
     const outside = /^\/|^[a-z]+:|(^|\/)\.\.?(\/|\?|$)/i.test(path)

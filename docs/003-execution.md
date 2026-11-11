@@ -165,6 +165,8 @@ The GitHub Source reads each Issue, pull request and Thread on its own: a failed
 
 GitHub answers 404 also when the agent lost access to a private repository, so a 404 is retried.
 
+The GitLab Source polls the project's opened Issues and merge requests by their update time, the notes of the ones it reads, and the default branch's pipelines. Each Trigger names its Thread `gitlab:issue:<iid>` or `gitlab:merge_request:<iid>` because GitLab numbers Issues and merge requests separately, and stream cursors clamp to a 14-day horizon so a long stop does not read months of history. The notes of a Thread are read again on the next poll; a failed read is retried, and counts towards an error of the Source, which it reports after three failed polls in a row by default.
+
 A notified Issue or pull request whose reads keep failing is dropped a day after its first failed read, and at once when GitHub reports it as deleted; it then no longer fails the poll, its Thread keeps the error, and the Source's state names it.
 
 Its read position stays where it was, so a later notification or a poll of its Thread reads what the failed reads missed.
