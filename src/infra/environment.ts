@@ -4,10 +4,10 @@
  * Provides default-path guardrails rather than an OS-level security boundary, as workers run under the operator's OS user.
  */
 import { lstat, mkdir, readdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
-import { realpathSync } from 'node:fs'
-import { delimiter, join, resolve } from 'node:path'
+import { existsSync, realpathSync } from 'node:fs'
+import { delimiter, dirname, join, resolve } from 'node:path'
 import type { SubprocessOutputReader, SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
-import type { Deployment, GitlabAccount } from '../deployment.ts'
+import type { Deployment, GitlabAccount, Probe } from '../deployment.ts'
 import { SetupError } from '../setup.ts'
 import { CliError } from './commands.ts'
 import { sameName } from './text.ts'
@@ -19,6 +19,14 @@ const LEGACY_MARKERS = ['dsh-tag', 'dsh-go', 'dsh-freelancer'].map(name => `# Wr
 export const WORKER_COMMANDS: readonly string[] = ['gh', 'git', 'gitlab', 'lark-cli']
 export const workerBin = (stateDir: string): string => join(stateDir, 'worker-bin')
 export const workerGitConfig = (stateDir: string): string => join(stateDir, 'worker-gitconfig')
+/** Variable naming the file a GitLab CLI reads its token from; the shim exports it because workers' environments are stripped of credential-shaped names. */
+export const GITLAB_TOKEN_VARIABLE = 'DSH_SUPERAGENT_GITLAB_TOKEN_FILE'
+/** Private file holding a Source's pasted credential; `Credentials` is the only writer. */
+export const credentialFile = (stateDir: string, source: string): string => join(stateDir, 'credentials', `${source}-token`)
+/** The deployment's own SSH key, which a GitLab deployment pushes with once setup has made it. */
+export const gitlabSshKey = (stateDir: string): string => join(stateDir, 'credentials', 'gitlab_ed25519')
+/** True when a regular file (not a directory or symlink) exists at `file`. */
+const exists = async (file: string): Promise<boolean> => lstat(file).then(entry => entry.isFile()).catch(() => false)
 const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`
 const gitQuote = (value: string): string => `"${value.replace(/[\\"]/g, char => `\\${char}`)}"`
 export const credentialHelper = (cli: string): string => `!${shellQuote(cli)} auth git-credential`
@@ -101,8 +109,11 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
   ].join('\n')
   const run = (program: string): string => `${withoutShims}\nexec ${shellQuote(program)} "$@"`
   const fail = (message: string): string => `echo ${shellQuote(message)} >&2\nexit 1`
+  // A pasted credential reaches the CLI through a file the shim names: DSH strips credential-shaped variables from
+  // worker environments, so exporting the variable inside the shim is the only way to hand it down.
+  const token = gitlab && await exists(credentialFile(stateDir, 'gitlab')) ? credentialFile(stateDir, 'gitlab') : undefined
   if (github) await shim('gh', run(github.cli))
-  if (gitlab) await shim('gitlab', run(gitlab.cli))
+  if (gitlab) await shim('gitlab', `${token ? `export ${GITLAB_TOKEN_VARIABLE}=${shellQuote(token)}\n` : ''}${run(gitlab.cli)}`)
   await shim('lark-cli', feishu ? run(feishu.cli) : fail('lark-cli is unavailable: this installation has no Feishu bot.'))
   for (const name of new Set(blockedCommands.filter(name => !WORKER_COMMANDS.includes(name)))) {
     await shim(name, fail(`${name} is blocked in this installation; use ${github ? 'gh' : 'gitlab'}, which acts as ${account}.`))
@@ -113,10 +124,14 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
     ? ['[credential "https://github.com"]', `\thelper = ${gitQuote(credentialHelper(github.cli))}`,
       '[url "https://github.com/"]', '\tinsteadOf = git@github.com:', '\tinsteadOf = ssh://git@github.com:']
     : []
+  // A deployment that made its own SSH key pushes with it explicitly, so worker git never falls back to the operator's
+  // SSH identity or a repository's `sshCommand`.
+  const ssh = gitlab?.sshKey ? ['[core]', `\tsshCommand = ${gitQuote(`ssh -i ${gitlab.sshKey} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`)}`] : []
   await own(workerGitConfig(stateDir), [
     MARKER,
     // Make git refuse to commit without an explicit identity set by the worker instead of guessing from the operator's OS user.
     '[user]', '\tuseConfigOnly = true',
+    ...ssh,
     '[credential]', '\thelper =',
     ...credentials,
     // Include Git LFS filters because the operator's global gitconfig (which usually holds them) is ignored.
@@ -126,7 +141,12 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
 
 /** Applies environment overrides and prepends worker shims to `process.env.PATH`, returning a restore callback. */
 export function applyEnvironment(variables: Record<string, string | undefined>, stateDir: string, path: string): () => void {
-  const values = { ...variables, PATH: [workerBin(stateDir), path].join(delimiter) }
+  // Host-side CLI calls (Source polling) run outside the worker shims and inherit `process.env`, so they are given the
+  // saved credential's file too. Workers still need the shim because DSH strips credential-shaped names from their
+  // environment; without a saved file the CLI keeps whatever configuration it already has.
+  const token = credentialFile(stateDir, 'gitlab')
+  const saved = existsSync(token) ? { [GITLAB_TOKEN_VARIABLE]: token } : {}
+  const values = { ...variables, ...saved, PATH: [workerBin(stateDir), path].join(delimiter) }
   const previous = Object.fromEntries(Object.keys(values).map(name => [name, process.env[name]]))
   const apply = (env: Record<string, string | undefined>): void => { for (const [name, value] of Object.entries(env)) { if (value === undefined) delete process.env[name]; else process.env[name] = value } }
   apply(values)
@@ -165,10 +185,34 @@ async function verifySsh(account: GitlabAccount, cwd: string, subprocess: Subpro
   let host = ''
   try { host = new URL(account.baseUrl).hostname } catch { /* Reported as the setup problem below. */ }
   if (!host) throw new SetupError('gitlabUrl', { url: account.baseUrl })
-  const output = await runAsWorker(subprocess, ['ssh', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', `git@${host}`], cwd,
+  // A deployment key signs in as the account even when the operator's SSH configuration would choose another key. It also
+  // records the instance's host key on first use, because a deployment that made its own key has not connected by hand.
+  const identity = account.sshKey ? ['-i', account.sshKey, '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=accept-new'] : []
+  const output = await runAsWorker(subprocess, ['ssh', '-T', ...identity, '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', `git@${host}`], cwd,
     AbortSignal.any([signal, AbortSignal.timeout(90_000)])).catch((error: unknown) => error instanceof CliError ? error.message : `ssh could not run: ${String(error)}`)
   const actual = /Welcome to GitLab, @([^!\s]+)!/i.exec(output)?.[1] ?? (output.split('\n')[0]!.trim() || 'no GitLab account')
   if (actual.toLowerCase() !== account.login.toLowerCase()) throw new SetupError('gitlabSshAccount', { host, account: account.login, actual })
+}
+
+/**
+ * Creates the deployment's own SSH key when it does not exist yet and registers its public half on the account the CLI
+ * is signed in to, so a pasted project token needs no SSH key handed to the operator beforehand. Idempotent: an existing
+ * key that the account already lists is left alone.
+ */
+export async function ensureSshKey(deployment: Deployment, probe: Probe, signal: AbortSignal): Promise<void> {
+  const { gitlab, stateDir } = deployment
+  if (!gitlab) return
+  signal.throwIfAborted()
+  const key = gitlabSshKey(stateDir)
+  if (!await exists(key)) {
+    await mkdir(dirname(key), { recursive: true, mode: 0o700 })
+    await probe(['ssh-keygen', '-t', 'ed25519', '-N', '', '-C', 'dsh-superagent deployment key', '-f', key])
+  }
+  const publicKey = (await readFile(`${key}.pub`, 'utf8')).trim()
+  const listed: unknown = JSON.parse(await probe([gitlab.cli, 'api', '/user/keys']))
+  const registered = Array.isArray(listed) && listed.some(item =>
+    typeof item === 'object' && item !== null && (item as { key?: unknown }).key === publicKey)
+  if (!registered) await probe([gitlab.cli, 'api', '--method', 'POST', '/user/keys', '--field', 'title=dsh-superagent', '--field', `key=${publicKey}`])
 }
 
 /**

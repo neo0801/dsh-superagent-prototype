@@ -1,8 +1,10 @@
 /** Probes repository and account CLIs, configures the worker execution environment and command shims, and tracks setup readiness. */
 import type { Context } from '@deepseek-ai/cordis'
+import { existsSync } from 'node:fs'
 import { UserError } from '../core/index.ts'
 import { SETUP_FIELDS, resolveDeployment, resolveFeishuBot, workerProbe, type Deployment, type Machine } from '../deployment.ts'
-import { agentVariables, applyEnvironment, verifyEnvironment, withoutDirectory, workerBin, writeEnvironment } from '../infra/environment.ts'
+import { agentVariables, applyEnvironment, credentialFile, ensureSshKey, verifyEnvironment, withoutDirectory, workerBin, writeEnvironment,
+  GITLAB_TOKEN_VARIABLE } from '../infra/environment.ts'
 import type { Settings, SettingsBlock } from '../policy.ts'
 import { SetupError, type SetupProblem } from '../setup.ts'
 
@@ -57,22 +59,38 @@ export class Setup {
   }
   /** Defer the restart to the next macrotask so the current HTTP or tool caller receives its response first. */
   restart(): void { setTimeout(this.host.restart, 0) }
-  /** Verify account CLIs for a modified source block before saving, ignoring setup errors belonging to other blocks. */
-  async checkAccounts(block: SettingsBlock, settings: Settings): Promise<void> {
+  /**
+   * Verify account CLIs for a modified source block before saving, ignoring setup errors belonging to other blocks.
+   * @returns The deployment the block resolved (GitHub or GitLab), or undefined for a Feishu block or an ignored error.
+   */
+  async checkAccounts(block: SettingsBlock, settings: Settings): Promise<Deployment | undefined> {
     const { machine } = this.host
     const source = block.slice(7)
     // A Source whose repository or project is now empty is a provider switch in progress: the other Source may not name one
     // yet, so setup reports the missing deployment repository on restart instead of the save being refused.
     const field = source === 'github' ? 'repository' : source === 'gitlab' ? 'project' : undefined
     const emptied = field !== undefined && !settings.sources[source]?.config[field]
-    const check = block === 'source:feishu' ? resolveFeishuBot(machine, settings.sources.feishu?.config, this.probe())
-      : resolveDeployment(machine, { github: settings.sources.github?.config, gitlab: settings.sources.gitlab?.config }, this.probe())
-    await check.catch((error: unknown) => {
+    const ignore = (error: unknown): undefined => {
       if (!(error instanceof SetupError)) throw error
-      if (emptied && (error.code === 'repositoryUnset' || error.code === 'projectUnset')) return
+      if (emptied && (error.code === 'repositoryUnset' || error.code === 'projectUnset')) return undefined
       // A Source's own problems belong to its card; a problem with the deployment as a whole, such as both Sources naming a repository, always refuses the save.
       if (error.place === source || error.place === 'deployment') throw error
-    })
+      return undefined
+    }
+    if (block === 'source:feishu') {
+      await resolveFeishuBot(machine, settings.sources.feishu?.config, this.probe()).catch(ignore)
+      return undefined
+    }
+    return resolveDeployment(machine, { github: settings.sources.github?.config, gitlab: settings.sources.gitlab?.config }, this.probe()).catch(ignore)
+  }
+  /**
+   * Creates the deployment's own SSH key and registers it with the account a pasted credential names, so the restart after
+   * the save can verify SSH as that account. A failure is reported and does not refuse the save; setup reports the SSH problem.
+   */
+  async ensureDeploymentKey(deployment: Deployment): Promise<void> {
+    if (!deployment.gitlab) return
+    try { await ensureSshKey(deployment, this.probe(), this.host.lifetime) }
+    catch (error) { this.host.context.logger.warn('dsh-superagent could not prepare the deployment SSH key: %s', String(error)) }
   }
   async blockCommands(blocked: readonly string[]): Promise<void> {
     if (this.resolved) await writeEnvironment(this.resolved, blocked)
@@ -81,7 +99,10 @@ export class Setup {
   /** Probes CLIs the way worker shells run them, using `stateDir` as `cwd` since it exists even before the repository clone is valid. */
   private probe() {
     const { context, machine, lifetime } = this.host
-    return workerProbe(context.subprocess, machine.stateDir, machine.stateDir, lifetime)
+    // A saved credential is handed to the CLI as a file path, not as the token itself: the CLI reads the file.
+    const file = credentialFile(machine.stateDir, 'gitlab')
+    const env: Record<string, string> = existsSync(file) ? { [GITLAB_TOKEN_VARIABLE]: file } : {}
+    return workerProbe(context.subprocess, machine.stateDir, machine.stateDir, lifetime, env)
   }
   private async resolve(settings: Settings): Promise<Deployment> {
     const { context, machine, lifetime } = this.host

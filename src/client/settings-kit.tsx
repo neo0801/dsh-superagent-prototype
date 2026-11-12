@@ -30,11 +30,12 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     {children}
   </SettingsContext.Provider>
 }
-export function useBlockDraft<V>(block: string, saved: V, revision: number, toValue: (draft: V) => unknown = draft => draft) {
+export function useBlockDraft<V>(block: string, saved: V, revision: number, toValue: (draft: V) => unknown = draft => draft,
+  persist?: (value: V) => V) {
   const { t, call, notify } = usePanel()
   const { state } = usePanelData()
   const { reload } = useSettings()
-  return useDraft({ key: `dsh-superagent/draft/${state?.masterId ?? ''}/${block}`, saved, revision, reload, save: async (value, from) => {
+  return useDraft({ key: `dsh-superagent/draft/${state?.masterId ?? ''}/${block}`, saved, revision, reload, persist, save: async (value, from) => {
     const result = await call('PUT settings/:block', { block, body: { value: toValue(value), revision: from } })
     notify(t(result.restarting ? 'savedRestarting' : 'saved'))
     return result
@@ -277,6 +278,10 @@ export function SourceField({ field, value, saved, fact, onChange, labels, refre
         </select>
         : <Input value={String(value ?? '')} readOnly={field.readonly} pattern={field.pattern} spellCheck={false}
           onChange={event => onChange(event.target.value)} />}
+    </Field>
+    case 'password': return <Field label={label} hint={hint}>
+      <Input type="password" autoComplete="new-password" spellCheck={false} value={String(value ?? '')}
+        placeholder={t('credentialPlaceholder')} onChange={event => onChange(event.target.value)} />
     </Field>
     case 'fact': return <div className="dt-field">
       <span className="dt-field-head">{label}{hint && <InfoTip text={hint} />}</span>

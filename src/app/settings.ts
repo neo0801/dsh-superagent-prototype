@@ -5,8 +5,10 @@ import { UserError, type EngineForSettings } from '../core/index.ts'
 import { EvalConfigSchema, ExecutorConfigSchema, PolicyConfigSchema, SettingsSchema, policyEffects, policyVersion } from '../policy.ts'
 import type { Settings as SettingsValue, SettingsBlock, SettingsOrigin, SettingsSave } from '../policy.ts'
 import type { SourceHost } from '../sources/host.ts'
+import { secretFields } from '../sources/kind.ts'
 import type { HealthBoard, HealthEntry } from '../infra/health.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
+import type { Credentials } from './credentials.ts'
 import { resolveRoleModel } from './role-models.ts'
 import { changedPaths, settingsNotice } from './notices.ts'
 import type { Sessions } from './sessions.ts'
@@ -52,10 +54,30 @@ const BLOCKS: Record<'policy' | 'eval' | 'executor' | 'source', Block> = {
   },
 }
 
+/**
+ * Removes a Source's write-only credential fields from a submitted settings block and returns the pasted credential, so
+ * the kind's schema never sees it. A blank field keeps the saved credential and is dropped from the configuration too.
+ */
+function withoutCredentials(sources: SourceRegistry, id: string, value: unknown): { value: unknown; credential?: string } {
+  const fields = secretFields(sources.kind(id)?.fields ?? [])
+  const config = fields.length && typeof value === 'object' && value !== null ? (value as { config?: unknown }).config : undefined
+  if (typeof config !== 'object' || config === null || Array.isArray(config)) return { value }
+  const kept: Record<string, unknown> = { ...config }
+  let credential: string | undefined
+  for (const field of fields) {
+    const text = kept[field]
+    delete kept[field]
+    if (typeof text === 'string' && text.trim()) credential = text.trim()
+  }
+  return { value: { ...(value as Record<string, unknown>), config: kept }, credential }
+}
+
 /** Host dependencies used by `Settings`. */
 export interface SettingsHost {
   readonly store: Pick<Store, 'settings' | 'saveSettings' | 'blockRevision' | 'atomic' | 'tickets' | 'get'>
   readonly sources: SourceRegistry
+  /** Write-only credentials saved outside every settings snapshot, by Source ID. */
+  readonly credentials: Pick<Credentials, 'read' | 'write'>
   /** Notified when a settings save changes the policy version. */
   readonly engine: EngineForSettings
   /** Health board where each source's policy sync reports under `sync:<id>`. */
@@ -67,8 +89,8 @@ export interface SettingsHost {
   readonly sessions: Pick<Sessions, 'notify' | 'delivery'>
   /** Source host passed to source kinds' policy syncs and label refreshes. */
   readonly sourceHost: SourceHost
-  /** Setup state, account/command checks, and restart trigger when setup-read fields change. */
-  readonly setup: Pick<Setup, 'configured' | 'checkAccounts' | 'blockCommands' | 'restart'>
+  /** Setup state, account/command checks, restart trigger, and SSH key preparation when setup-read fields change. */
+  readonly setup: Pick<Setup, 'configured' | 'checkAccounts' | 'ensureDeploymentKey' | 'blockCommands' | 'restart'>
   /** Triggers an immediate pass so work newly allowed by a settings save runs right away. */
   requestPass(): void
 }
@@ -140,6 +162,8 @@ export class Settings {
    * Validates and saves one settings block against its `revision`; a no-op save records no new revision, a changed policy
    * version notifies affected open tickets, and changing a setup-read field (`SETUP_FIELDS`, such as an account CLI) or any
    * change saved while waiting for setup (`!this.host.setup.configured()`) restarts `dsh-superagent` so setup runs again.
+   * A submitted write-only credential is kept out of the settings snapshot, checked against the account, and saved with a
+   * restart even when the visible configuration did not change, so the client sees a new revision and the new account applies.
    * @param origin - Caller origin; restricts execution-environment and account-CLI changes to `'panel'` (a guardrail against prompt-injected tool calls, not an OS security boundary, since agents run shell commands; `origin` has no default so no caller receives panel privileges implicitly).
    * @returns Save outcome with the block's current `revision`, whether `policy_changed`, whether `restarting`, and `context_delivery` status (`'injected'` or `'pending'`).
    * @throws SettingsConflict when `block`'s revision changed before or during validation checks.
@@ -154,45 +178,65 @@ export class Settings {
     if (!(kind in BLOCKS)) throw new UserError('unknownBlock', { block })
     const rules = BLOCKS[kind as keyof typeof BLOCKS]
     if (kind === 'source' && !sources.kind(id)) throw new UserError('sourceNotInstalled', { source: id })
-    const parsed = rules.parse(value, sources, id)
-    const current = store.settings()
-    const candidate = rules.merge(current, parsed, id)
-    const model = block === 'eval' ? candidate.eval.model : block === 'executor' ? candidate.executor.model : null
-    const previous = block === 'eval' ? current.eval.model : block === 'executor' ? current.executor.model : null
-    if (model && JSON.stringify(model) !== JSON.stringify(previous)) {
-      try { await resolveRoleModel(this.host.context, model) }
-      catch (error) { throw new UserError('modelUnavailable', { block, error: error instanceof Error ? error.message : String(error) }) }
+    // The credential is taken out before the kind's schema sees the block; the saved credential is read first so a later
+    // failure can put it back, and it is written before the account check because the check's CLI reads the new file.
+    const submitted = kind === 'source' ? withoutCredentials(sources, id, value) : { value, credential: undefined }
+    const credential = submitted.credential
+    // Only the management panel may hand over a Source's credential, as with the account fields setup reads.
+    if (credential !== undefined && origin !== 'panel') throw new UserError('panelOnlyAccounts')
+    const parsed = rules.parse(submitted.value, sources, id)
+    const savedCredential = credential === undefined ? undefined : this.host.credentials.read(id)
+    if (credential !== undefined) await this.host.credentials.write(id, credential)
+    try {
+      const current = store.settings()
+      const candidate = rules.merge(current, parsed, id)
+      const model = block === 'eval' ? candidate.eval.model : block === 'executor' ? candidate.executor.model : null
+      const previous = block === 'eval' ? current.eval.model : block === 'executor' ? current.executor.model : null
+      if (model && JSON.stringify(model) !== JSON.stringify(previous)) {
+        try { await resolveRoleModel(this.host.context, model) }
+        catch (error) { throw new UserError('modelUnavailable', { block, error: error instanceof Error ? error.message : String(error) }) }
+      }
+      rules.guard?.(current, candidate, origin)
+      // A pasted credential decides the account even when no setup-read field changed, so it is always checked; a
+      // credential save also prepares the deployment's own SSH key for the account the token names.
+      if (setupChanged(current, candidate) || credential !== undefined) {
+        const deployment = await this.host.setup.checkAccounts(block, candidate)
+        if (credential !== undefined && deployment?.gitlab) await this.host.setup.ensureDeploymentKey(deployment)
+      }
+      if (stale()) throw new SettingsConflict('Settings changed during the checks. Reload before saving.')
+      // Re-read current settings after async checks in case unrelated blocks were saved concurrently.
+      const old = store.settings()
+      const settings = rules.merge(old, parsed, id)
+      // A credential save must record a new revision even when the visible configuration is unchanged: the client clears
+      // its draft on the revision change, and the restart applies the new account.
+      if (credential === undefined && JSON.stringify(SettingsSchema.parse(settings)) === JSON.stringify(old)) {
+        const delivery = await sessions.delivery(`settings:${block}`)
+        return { saved: true, revision: store.blockRevision(block), policy_changed: false, restarting: false, context_delivery: delivery }
+      }
+      const restarting = setupChanged(old, settings) || !this.host.setup.configured() || credential !== undefined
+      const before = policyVersion(old), after = policyVersion(settings)
+      const scope = (version: SettingsValue) => ({
+        scope: (input: { source: string; meta: Record<string, unknown> }) => this.host.sources.scope(input, version) })
+      const effects = before === after ? new Map() : policyEffects(store.tickets.open(), old, SettingsSchema.parse(settings), scope)
+      const notified = [...effects.keys()]
+      store.atomic(() => {
+        store.saveSettings(SettingsSchema.parse(settings), { source: origin, block, policyVersion: after, policyChanged: before !== after, notified })
+        if (origin !== 'tool') sessions.notify(...settingsNotice(block, changedPaths(old, settings)))
+        if (before !== after) engine.policyChanged(before, after, effects)
+      })
+      // Rewrite worker command shims immediately when `blockedCommands` changes.
+      const blocked = settings.executor.blockedCommands
+      const changed = blocked.join(' ') !== old.executor.blockedCommands.join(' ')
+      if (changed) await this.host.setup.blockCommands(blocked)
+      // When restarting, the notice stays pending until after the restart; `setup.restart()` defers until this call returns.
+      const delivery = restarting ? 'pending' : await sessions.delivery(`settings:${block}`)
+      if (restarting) this.host.setup.restart()
+      else this.host.requestPass()
+      return { saved: true, revision: store.blockRevision(block), policy_changed: before !== after, restarting, context_delivery: delivery }
+    } catch (error) {
+      if (credential !== undefined) await this.host.credentials.write(id, savedCredential)
+      throw error
     }
-    rules.guard?.(current, candidate, origin)
-    if (setupChanged(current, candidate)) await this.host.setup.checkAccounts(block, candidate)
-    if (stale()) throw new SettingsConflict('Settings changed during the checks. Reload before saving.')
-    // Re-read current settings after async checks in case unrelated blocks were saved concurrently.
-    const old = store.settings()
-    const settings = rules.merge(old, parsed, id)
-    if (JSON.stringify(SettingsSchema.parse(settings)) === JSON.stringify(old)) {
-      const delivery = await sessions.delivery(`settings:${block}`)
-      return { saved: true, revision: store.blockRevision(block), policy_changed: false, restarting: false, context_delivery: delivery }
-    }
-    const restarting = setupChanged(old, settings) || !this.host.setup.configured()
-    const before = policyVersion(old), after = policyVersion(settings)
-    const scope = (version: SettingsValue) => ({
-      scope: (input: { source: string; meta: Record<string, unknown> }) => this.host.sources.scope(input, version) })
-    const effects = before === after ? new Map() : policyEffects(store.tickets.open(), old, SettingsSchema.parse(settings), scope)
-    const notified = [...effects.keys()]
-    store.atomic(() => {
-      store.saveSettings(SettingsSchema.parse(settings), { source: origin, block, policyVersion: after, policyChanged: before !== after, notified })
-      if (origin !== 'tool') sessions.notify(...settingsNotice(block, changedPaths(old, settings)))
-      if (before !== after) engine.policyChanged(before, after, effects)
-    })
-    // Rewrite worker command shims immediately when `blockedCommands` changes.
-    const blocked = settings.executor.blockedCommands
-    const changed = blocked.join(' ') !== old.executor.blockedCommands.join(' ')
-    if (changed) await this.host.setup.blockCommands(blocked)
-    // When restarting, the notice stays pending until after the restart; `setup.restart()` defers until this call returns.
-    const delivery = restarting ? 'pending' : await sessions.delivery(`settings:${block}`)
-    if (restarting) this.host.setup.restart()
-    else this.host.requestPass()
-    return { saved: true, revision: store.blockRevision(block), policy_changed: before !== after, restarting, context_delivery: delivery }
   }
   /**
    * Pauses or resumes processing (new evaluations, worker dispatch, and channel delivery, while Sources continue recording

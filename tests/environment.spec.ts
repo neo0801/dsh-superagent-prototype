@@ -314,4 +314,16 @@ describe('GitLab worker environment', () => {
       .rejects.toMatchObject({ code: 'gitlabUrl', values: { url: 'gitlab.example.com' } })
     expect(calls.some(call => call[0] === 'ssh')).toBe(false)
   })
+  it('pushes with the deployment\'s own key and names the file a pasted token is kept in', async () => {
+    const key = join(dir, 'credentials', 'gitlab_ed25519'), file = join(dir, 'credentials', 'gitlab-token')
+    mkdirSync(join(dir, 'credentials'), { recursive: true })
+    writeFileSync(file, 'glpat-secret', { mode: 0o600 })
+    writeFileSync(key, 'private key', { mode: 0o600 })
+    const cli = program(join(dir, 'gitlab-cli'), 'printf %s "$DSH_SUPERAGENT_GITLAB_TOKEN_FILE"')
+    await writeEnvironment(deployment({ cli, sshKey: key }), [])
+    // Worker git pushes with the deployment's key instead of the operator's SSH identity or the repository's sshCommand.
+    expect(readFileSync(workerGitConfig(dir), 'utf8')).toContain(`sshCommand = "ssh -i ${key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"`)
+    // DSH strips credential-shaped variables from a worker environment, so the shim itself exports the file the CLI reads.
+    expect((await exec(join(workerBin(dir), 'gitlab'), ['api', '/user'], { env: { PATH: '/usr/bin:/bin' } })).stdout).toBe(file)
+  })
 })

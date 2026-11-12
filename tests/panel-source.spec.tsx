@@ -120,6 +120,38 @@ it('shows the account each CLI signs in as, and keeps a saved CLI on screen whil
   expect(sessionStorage.getItem('dsh-superagent/draft/master/source:github')).toBeNull()
 })
 
+it('takes a project token in a write-only field, keeps it off the page, and keeps the saved one when the field is blank', async () => {
+  server.settings.sources.gitlab = { enabled: true, config: { project: 'acme/platform/widgets', cli: '/opt/gitlab',
+    baseUrl: 'https://gitlab.example.com' } }
+  await mount()
+  await click(zh['tab.source'])
+  await click(find(zh['tab.settings'], '.dt-status-head button'))
+  const card = () => all('.dt-card')[2]!
+  expect(card().querySelector('.dt-row-title')?.firstChild?.textContent).toBe('GitLab')
+  const token = field<HTMLInputElement>('部署凭据')
+  expect(token.type).toBe('password')
+  expect(token.value).toBe('')
+  await type(token, 'glpat-secret')
+  await act(async () => { card().dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })) }); await settle()
+  expect(server.requests.find(request => request.path === 'settings/source:gitlab')).toMatchObject({ method: 'PUT',
+    body: { revision: 0, value: { enabled: true, config: { project: 'acme/platform/widgets', cli: '/opt/gitlab',
+      baseUrl: 'https://gitlab.example.com', token: 'glpat-secret' } } } })
+  // The host keeps the token outside the settings, and nothing the page stores for a reload holds it.
+  expect(server.credentials.gitlab).toEqual({ token: 'glpat-secret' })
+  expect(JSON.stringify(server.settings.sources.gitlab)).not.toContain('glpat-secret')
+  expect(sessionStorage.getItem('dsh-superagent/draft/master/source:gitlab')).toBeNull()
+  // A saved token is never shown again, and a blank field keeps it instead of clearing it.
+  await remount()
+  await click(zh['tab.source'])
+  await click(find(zh['tab.settings'], '.dt-status-head button'))
+  expect(field<HTMLInputElement>('部署凭据').value).toBe('')
+  await click('运行来源：GitLab')
+  await act(async () => { card().dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })) }); await settle()
+  const last = server.requests.filter(request => request.path === 'settings/source:gitlab').at(-1) as { body: { value: { config: object } } }
+  expect(last.body.value.config).not.toHaveProperty('token')
+  expect(server.credentials.gitlab).toEqual({ token: 'glpat-secret' })
+})
+
 it('points a setup problem at the settings that fix it', async () => {
   server.setup = { ...server.setup, problem: problemOf('agentCliUnset'), accounts: null }
   // jsdom has no scrolling; mock scrollIntoView to record which card the link brings into view.

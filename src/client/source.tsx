@@ -1,6 +1,6 @@
 /** Source status view (health, filtered Triggers, dropped replies) and Source settings cards. */
 import { useEffect, useState } from 'react'
-import type { FieldSpec } from '../sources/kind.ts'
+import { secretFields, type FieldSpec } from '../sources/kind.ts'
 import { usePoll, type DroppedReply, type SourceStatusRow, type SourceView } from './api.ts'
 import { DisclosureRow, Dot, Icon, InfoTip, Switch, Tag } from './controls.tsx'
 import { SaveBar } from './draft.tsx'
@@ -11,6 +11,14 @@ import { ConfigHistory, Fields, SourceField, useBlockDraft, useSettings } from '
 import { actorName, healthText, localized, readableMarkers, reasonLabel, valueLabel, when } from './text.ts'
 import { CheckSetupButton, Hint, LabelValue, LoadState, SetupMessage, StatusHead, When } from './widgets.tsx'
 
+type SourceValue = SourceView['value']
+// A blank secret field means "keep the saved credential", so drop it before submitting.
+const dropBlankSecrets = (value: SourceValue, secrets: string[]): SourceValue => ({ ...value,
+  config: Object.fromEntries(Object.entries(value.config).filter(([key, current]) => !secrets.includes(key) || current !== undefined
+    && current !== '')) })
+// Never write secret fields to sessionStorage; they stay in React state only.
+const omitSecrets = (value: SourceValue, secrets: string[]): SourceValue => ({ ...value,
+  config: Object.fromEntries(Object.entries(value.config).filter(([key]) => !secrets.includes(key))) })
 function SourceCard({ source }: { source: SourceView }) {
   const { t, call } = usePanel()
   const { running } = usePanelData()
@@ -18,7 +26,9 @@ function SourceCard({ source }: { source: SourceView }) {
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const refreshLabels = async () => { const { added } = await call('POST sources/:id/labels',
     { id: source.id }); await reload(); return added }
-  const draft = useBlockDraft(`source:${source.id}`, source.value, source.revision)
+  const secrets = secretFields(source.fields)
+  const draft = useBlockDraft(`source:${source.id}`, source.value, source.revision, value => dropBlankSecrets(value, secrets),
+    value => omitSecrets(value, secrets))
   const value = draft.value
   const { problem, value: saved } = source
   const changed = (key: string) => String(value.config[key] ?? '') !== String(saved.config[key] ?? '')

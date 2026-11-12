@@ -131,9 +131,10 @@ export interface DraftOptions<V> {
   revision: number | undefined
   save: (value: V, revision: number, base: V) => Promise<{ revision: number; restarting?: boolean }>
   reload: () => Promise<unknown>
+  persist?: (value: V) => V
 }
 /** Manage a settings draft, persisting unsaved edits in `sessionStorage` and rebasing them when newer server revisions arrive. */
-export function useDraft<V, M = undefined>({ key, saved, revision, save, reload }: DraftOptions<V>) {
+export function useDraft<V, M = undefined>({ key, saved, revision, save, reload, persist }: DraftOptions<V>) {
   const { restart } = usePanel()
   const [state, dispatch] = useReducer(draftReducer<V, M>, undefined, () => {
     const stored = read<V, M>(key)
@@ -143,7 +144,8 @@ export function useDraft<V, M = undefined>({ key, saved, revision, save, reload 
   if (state.phase !== 'saving' && revision !== undefined && revision !== state.seen) dispatch({ type: 'revisionArrived', saved, revision })
   useEffect(() => {
     if (!key) return
-    try { if (state.draft) sessionStorage.setItem(key, JSON.stringify(state.draft)); else sessionStorage.removeItem(key) }
+    try { if (state.draft) sessionStorage.setItem(key, JSON.stringify(persist ? { ...state.draft, value: persist(state.draft.value) }
+      : state.draft)); else sessionStorage.removeItem(key) }
     catch (failure) { dispatch({ type: 'refused', notice: { kind: 'unstored', error: errorText(failure) } }) }
   }, [key, state.draft])
   const failed = (failure: unknown) => dispatch({ type: 'refused', notice: { kind: 'failed', error: errorText(failure) } })

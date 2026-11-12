@@ -153,6 +153,7 @@ const TEXT = {
   sourceNotInstalled: ['插件未安装', 'Plugin not installed'],
   sourceNotInstalledHint: ['提供这个来源的插件没有加载，配置按保存时的样子保留。', 'The plugin that provides this Source is not loaded; its configuration is kept as saved.'],
   sourceEnable: ['运行来源：{name}', 'Run Source: {name}'],
+  credentialPlaceholder: ['留空则保持已保存的凭据', 'Leave blank to keep the saved credential'],
   addRow: ['添加', 'Add'],
   removeRow: ['移除：{name}', 'Remove: {name}'],
   sourceFilteredTitle: ['24 小时内最近被过滤的触发', 'Latest Triggers filtered in the last 24 hours'],

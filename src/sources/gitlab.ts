@@ -172,6 +172,8 @@ export const gitlabKind: SourceKind<GitlabConfig> = {
   fields: [
     { key: 'project', type: 'text', pattern: '[A-Za-z0-9_.\\-]+(?:/[A-Za-z0-9_.\\-]+)+', label: { zh: '工作项目', en: 'Project' },
       hint: { zh: '写作 group/project；组可以有多层，例如 group/subgroup/project。这个项目是执行器的工作仓库；保存时检查智能体账号能否推送到它，然后重启 dsh-superagent。', en: 'Written group/project; groups may be nested, as in group/subgroup/project. This project is the Executor\'s repository; saving checks that the agent account can push to it, then restarts dsh-superagent.' } },
+    { key: 'token', type: 'password', label: { zh: '部署凭据', en: 'Project token' },
+      hint: { zh: '粘贴为这个工作项目新建的 project access token，scope 至少为 api 和 write_repository。保存后写入部署状态目录并记入数据库，不进入设置快照；留空则沿用已保存的凭据。', en: 'Paste a project access token created for this working project, with at least the api and write_repository scopes. Saving writes it to the deployment state directory and the database, never to the settings snapshot; leave it blank to keep the saved credential.' } },
     { key: 'cli', type: 'text', label: { zh: '智能体的 GitLab CLI', en: 'Agent GitLab CLI' },
       hint: { zh: '命令名或绝对路径，通常是携带 token 的 GitLab CLI，支持 api <path>。智能体以它登录的账号行事，执行器以 gitlab 调用它。保存时检查这个账号能否推送到项目，然后重启 dsh-superagent。', en: 'A command name or absolute path, usually a GitLab CLI that carries the token and supports `api <path>`. The agent acts as the account it is signed in to, and the Executor calls it as gitlab. Saving checks that this account can push to the project, then restarts dsh-superagent.' } },
     { key: 'baseUrl', type: 'text', label: { zh: 'GitLab 地址', en: 'GitLab URL' },
