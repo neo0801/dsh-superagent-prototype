@@ -3,6 +3,8 @@ import { SETUP_FIELDS } from '../../deployment.ts'
 import { KV } from '../../kv.ts'
 import { policyVersion } from '../../policy.ts'
 import type { SourceRegistry } from '../../sources/registry.ts'
+import { secretFields } from '../../sources/kind.ts'
+import type { Credentials } from '../credentials.ts'
 import { declaredVariables, executionRoot } from '../execution-environment.ts'
 import type { Store } from '../store.ts'
 import { problemOf, sourceHealth, type HealthMap, type SetupState } from './sources.ts'
@@ -18,9 +20,11 @@ function policyOf(sources: SourceRegistry, id: string, health: HealthMap) {
 }
 /**
  * Builds the settings view by block (`{ value, revision }`), per-Source configuration and restart-sensitive fields,
- * and execution environment details (`stateDir` provides the default ticket working directory root).
+ * the stored credentials' presence per write-only field (never their values), and execution environment details
+ * (`stateDir` provides the default ticket working directory root).
  */
-export function settingsView(store: Store, sources: SourceRegistry, health: HealthMap, setup: SetupState, stateDir: string) {
+export function settingsView(store: Store, sources: SourceRegistry, health: HealthMap, setup: SetupState, stateDir: string,
+  credentials: Pick<Credentials, 'status'>) {
   const settings = store.settings()
   const block = <V>(name: 'policy' | 'eval' | 'executor', value: V) => ({ value, revision: store.blockRevision(name) })
   return {
@@ -31,9 +35,13 @@ export function settingsView(store: Store, sources: SourceRegistry, health: Heal
       const kind = sources.kind(instance.kind)
       const problem = problemOf(instance.id, setup)
       const { id, title } = sourceHealth(sources, instance, health)
+      const secrets = secretFields(kind?.fields ?? [])
       return { id, kind: instance.kind, title, description: kind?.description ?? { zh: '', en: '' }, installed: instance.installed,
         value: { enabled: instance.enabled, config: instance.config }, revision: store.blockRevision(`source:${instance.id}`),
-        restarts: SETUP_FIELDS[instance.id] ?? [], fields: kind?.fields ?? [], facts: kind?.facts?.(setup.deployment) ?? {},
+        restarts: [...SETUP_FIELDS[instance.id] ?? [], ...secrets], fields: kind?.fields ?? [],
+        // A write-only field reports only whether the credential store holds a value, where it came from, and writability.
+        credentials: Object.fromEntries(secrets.map(key => [key, credentials.status(instance.id)])),
+        facts: kind?.facts?.(setup.deployment) ?? {},
         labels: store.get(KV.sources.labels(instance.id)) ?? {}, ...problem ? { problem } : {}, ...policyOf(sources, instance.id, health) }
     }),
     environment: { root: executionRoot(settings, stateDir), variables: declaredVariables(sources, settings) },

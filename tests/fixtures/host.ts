@@ -239,9 +239,17 @@ export async function startRuntime(seed?: (store: Store) => void) {
   const webServer = { host: '127.0.0.1', port: 3082, register: (route: { handler: HttpHandler }) => { http = route.handler; return () => {} } }
   const jobs = jobRegistry(id => agents.get(id))
   const subagents = subagentRuntime(agents)
+  /** The host's credential store: an in-memory stand-in for `ctx.credentials`, which the panel writes and the CLIs read. */
+  const secrets = new Map<string, string>()
+  const credentialStore = {
+    resolve: vi.fn(async (ref: string) => secrets.has(ref) ? { value: secrets.get(ref)!, source: 'store' } : undefined),
+    describe: vi.fn(async (ref: string) => secrets.has(ref) ? { configured: true, source: 'store', writable: true } : { configured: false, writable: true }),
+    set: vi.fn(async (ref: string, value: string) => { secrets.set(ref, value) }),
+    unset: vi.fn(async (ref: string) => { secrets.delete(ref) }),
+  }
   const services = { agents, llm: { resolveCallConfig: vi.fn(async (value: unknown) => value) }, sessionController: controller,
     sessionPersistence: persistence, workspaceRegistry: { create: async (cwd: string) => ({ id: cwd }) }, permissionPresets: { set: () => {} }, subprocess, webServer,
-    jobs: jobs.service, subagents: subagents.service }
+    credentials: credentialStore, jobs: jobs.service, subagents: subagents.service }
   const ctx = new Context()
   for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
   for (const cli of [AGENT, BOT]) writeFileSync(cli, '#!/bin/sh\n', { mode: 0o755 })
@@ -295,6 +303,6 @@ export async function startRuntime(seed?: (store: Store) => void) {
   /** A step of the worker claims what waits for it, and is cut off before the Session took it. */
   const claim = (sessionId: string) => { claims.get(sessionId)!() }
   return { runtime, ctx, directory, agents, tools, deliveries, relays, candidates, runTool, route, acceptedTicket, api, controller, subprocess, hooks, resolveDefault, stop,
-    jobs, subagents, step, claim }
+    jobs, subagents, step, claim, secrets, credentialStore }
 }
 export type Host = Awaited<ReturnType<typeof startRuntime>>

@@ -99,7 +99,7 @@ it('shows the account each CLI signs in as, and keeps a saved CLI on screen whil
   const github = all('.dt-card')[1]!
   expect(github.textContent).toContain('当前账号 @agent-bot')
   const labels = () => [...github.querySelectorAll('label')].map(label => label.textContent)
-  expect(labels()).toEqual(['监听的仓库', '智能体的 GitHub CLI'])
+  expect(labels()).toEqual(['监听的仓库', '部署凭据', '智能体的 GitHub CLI'])
   expect(field<HTMLInputElement>('监听的仓库').value).toBe('acme/widgets')
   // A fact describes the saved value, so an edited CLI shows none until it is saved.
   await type(field<HTMLInputElement>('智能体的 GitHub CLI'), 'gh-other')
@@ -107,7 +107,7 @@ it('shows the account each CLI signs in as, and keeps a saved CLI on screen whil
   await click(zh.discard)
   expect(github.textContent).toContain('当前账号 @agent-bot')
   await click([...github.querySelectorAll<HTMLElement>('[data-disclosure-row]')].find(row => row.textContent?.includes('高级'))!)
-  expect(labels()).toEqual(['监听的仓库', '智能体的 GitHub CLI', '轮询间隔 / 秒', '连续失败几次后报告异常'])
+  expect(labels()).toEqual(['监听的仓库', '部署凭据', '智能体的 GitHub CLI', '轮询间隔 / 秒', '连续失败几次后报告异常'])
   expect(all('.dt-card')[0]!.textContent).toContain('当前机器人 Widgets Bot')
   await type(field<HTMLInputElement>('智能体的 GitHub CLI'), '/opt/bin/gh-agent')
   expect(github.textContent).toContain('保存会重启 dsh-superagent：2 个进行中的派工会中断，并带恢复说明重新开始。')
@@ -118,6 +118,45 @@ it('shows the account each CLI signs in as, and keeps a saved CLI on screen whil
   expect(field<HTMLInputElement>('智能体的 GitHub CLI').value).toBe('/opt/bin/gh-agent')
   expect(field('智能体的 GitHub CLI').matches(':disabled')).toBe(true)
   expect(sessionStorage.getItem('dsh-superagent/draft/master/source:github')).toBeNull()
+})
+
+it('takes a project token in a write-only field, keeps it off the page, and keeps the saved one when the field is blank', async () => {
+  server.settings.sources.gitlab = { enabled: true, config: { project: 'acme/platform/widgets', cli: '/opt/gitlab',
+    baseUrl: 'https://gitlab.example.com' } }
+  await mount()
+  await click(zh['tab.source'])
+  await click(find(zh['tab.settings'], '.dt-status-head button'))
+  const card = () => all('.dt-card')[2]!
+  expect(card().querySelector('.dt-row-title')?.firstChild?.textContent).toBe('GitLab')
+  // Both Sources now carry a write-only credential field, so the GitLab one is looked up inside its own card.
+  const token = () => card().querySelector<HTMLInputElement>('input[type="password"]')!
+  expect(token().type).toBe('password')
+  expect(token().value).toBe('')
+  await type(token(), 'glpat-secret')
+  await act(async () => { card().dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })) }); await settle()
+  expect(server.requests.find(request => request.path === 'settings/source:gitlab')).toMatchObject({ method: 'PUT',
+    body: { revision: 0, value: { enabled: true, config: { project: 'acme/platform/widgets', cli: '/opt/gitlab',
+      baseUrl: 'https://gitlab.example.com', token: 'glpat-secret' } } } })
+  // The host keeps the token outside the settings, and nothing the page stores for a reload holds it.
+  expect(server.credentials.gitlab).toEqual({ token: 'glpat-secret' })
+  expect(JSON.stringify(server.settings.sources.gitlab)).not.toContain('glpat-secret')
+  expect(sessionStorage.getItem('dsh-superagent/draft/master/source:gitlab')).toBeNull()
+  // A saved token is never shown again, and a blank field keeps it instead of clearing it.
+  await remount()
+  await click(zh['tab.source'])
+  await click(find(zh['tab.settings'], '.dt-status-head button'))
+  expect(token().value).toBe('')
+  await click('运行来源：GitLab')
+  await act(async () => { card().dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })) }); await settle()
+  const last = server.requests.filter(request => request.path === 'settings/source:gitlab').at(-1) as { body: { value: { config: object } } }
+  expect(last.body.value.config).not.toHaveProperty('token')
+  expect(server.credentials.gitlab).toEqual({ token: 'glpat-secret' })
+  // The card reports the stored credential and where it came from, and clearing it needs no settings save.
+  expect(card().textContent).toContain('已配置（来源：store）')
+  await click([...card().querySelectorAll('button')].find(button => button.textContent === '清除')!)
+  expect(server.credentials.gitlab).toBeUndefined()
+  expect(server.requests.some(request => request.path === 'sources/gitlab/credential/clear')).toBe(true)
+  expect([...document.querySelectorAll('.dt-toast')].at(-1)?.textContent).toBe(zh.credentialCleared)
 })
 
 it('points a setup problem at the settings that fix it', async () => {

@@ -3,7 +3,7 @@ import { cloneElement, createContext, useContext, useEffect, useId, useLayoutEff
   type ReactNode } from 'react'
 import type { ApiResponse } from '../app/api.ts'
 import type { FieldSpec, Localized } from '../sources/kind.ts'
-import { usePoll, type HistoryView, type Settings, type SettingsView, type SourceView } from './api.ts'
+import { usePoll, type HistoryView, type Settings, type SettingsView, type SourceCredential, type SourceView } from './api.ts'
 import { Button, DisclosureRow, Icon, InfoTip, Input, SegmentedControl, Switch } from './controls.tsx'
 import { useDraft } from './draft.tsx'
 import { useAction, usePanel, usePanelData } from './provider.tsx'
@@ -30,11 +30,12 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     {children}
   </SettingsContext.Provider>
 }
-export function useBlockDraft<V>(block: string, saved: V, revision: number, toValue: (draft: V) => unknown = draft => draft) {
+export function useBlockDraft<V>(block: string, saved: V, revision: number, toValue: (draft: V) => unknown = draft => draft,
+  persist?: (value: V) => V) {
   const { t, call, notify } = usePanel()
   const { state } = usePanelData()
   const { reload } = useSettings()
-  return useDraft({ key: `dsh-superagent/draft/${state?.masterId ?? ''}/${block}`, saved, revision, reload, save: async (value, from) => {
+  return useDraft({ key: `dsh-superagent/draft/${state?.masterId ?? ''}/${block}`, saved, revision, reload, persist, save: async (value, from) => {
     const result = await call('PUT settings/:block', { block, body: { value: toValue(value), revision: from } })
     notify(t(result.restarting ? 'savedRestarting' : 'saved'))
     return result
@@ -251,10 +252,38 @@ function RowsField({ field, value, saved, onChange, labels, refreshLabels }: {
     </li>)}</ul>}
   </div>
 }
-export function SourceField({ field, value, saved, fact, onChange, labels, refreshLabels }: {
+/**
+ * Write-only credential input with its state: a saved credential says where it came from and can be cleared, a missing one
+ * says so. Clearing happens immediately rather than through the card's draft, so a failure is reported here.
+ */
+function CredentialField({ label, hint, value, credential, onClear, onChange }: {
+  label: string; hint: string; value: unknown; credential?: SourceCredential; onClear?: () => Promise<void>
+  onChange: (next: unknown) => void
+}) {
+  const { t, notify } = usePanel()
+  const [clearing, setClearing] = useState(false)
+  const clear = async () => {
+    if (!onClear) return
+    setClearing(true)
+    try { await onClear() } catch (failure) { notify(errorText(failure)) } finally { setClearing(false) }
+  }
+  const state = credential && <span className="dt-row-meta">
+    <span>{credential.configured ? t('credentialConfigured', { source: credential.source ?? '' }) : t('credentialUnconfigured')}</span>
+    {credential.configured && onClear !== undefined && <Button variant="ghost" size="sm" disabled={!credential.writable || clearing}
+      aria-busy={clearing} onClick={() => { void clear() }}>{t('credentialClear')}</Button>}
+  </span>
+  return <Field label={label} hint={hint} note={state}>
+    <Input type="password" autoComplete="new-password" spellCheck={false} value={String(value ?? '')}
+      placeholder={t('credentialPlaceholder')} onChange={event => onChange(event.target.value)} />
+  </Field>
+}
+export function SourceField({ field, value, saved, fact, onChange, labels, refreshLabels, credential,
+  onClearCredential }: {
   field: FieldSpec; value: unknown; saved: unknown; fact: Localized | string | undefined; onChange: (next: unknown) => void
   labels: Record<string, string>
   refreshLabels?: () => Promise<string[]>
+  credential?: SourceCredential
+  onClearCredential?: () => Promise<void>
 }) {
   const { t, navigate } = usePanel()
   const label = localized(t, field.label), hint = localized(t, field.hint)
@@ -278,6 +307,8 @@ export function SourceField({ field, value, saved, fact, onChange, labels, refre
         : <Input value={String(value ?? '')} readOnly={field.readonly} pattern={field.pattern} spellCheck={false}
           onChange={event => onChange(event.target.value)} />}
     </Field>
+    case 'password': return <CredentialField label={label} hint={hint} value={value} credential={credential}
+      onClear={onClearCredential} onChange={onChange} />
     case 'fact': return <div className="dt-field">
       <span className="dt-field-head">{label}{hint && <InfoTip text={hint} />}</span>
       <span className="dt-mono">{localized(t, fact) || t('empty')}</span>

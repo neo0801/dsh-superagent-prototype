@@ -1,12 +1,12 @@
 /** Plugin configuration and startup verification for repository access and agent CLI identities. */
 import { LIMITS } from './limits.ts'
-import { accessSync, constants, statSync } from 'node:fs'
+import { accessSync, constants, existsSync, statSync } from 'node:fs'
 import { delimiter, isAbsolute, join } from 'node:path'
 import type { Volatile } from '@deepseek-ai/cordis'
 import s from '@deepseek-ai/schemastery'
 import { z } from 'zod'
 import type { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
-import { runAsWorker, sameDirectory, withoutDirectory, workerBin } from './infra/environment.ts'
+import { gitlabSshKey, runAsWorker, sameDirectory, withoutDirectory, workerBin } from './infra/environment.ts'
 import { sameName } from './infra/text.ts'
 import { SetupError } from './setup.ts'
 import type { RepositoryIdentity } from './core/index.ts'
@@ -77,7 +77,9 @@ export interface Deployment extends Machine {
 /** Which repository provider a deployment works on; a Source of the other provider may still receive triggers but does not run the work. */
 export const providerOf = (deployment: Pick<Deployment, 'github'>): 'github' | 'gitlab' => deployment.github ? 'github' : 'gitlab'
 export interface GithubAccount { cli: string; login: string; noreply: string }
-export interface GitlabAccount { cli: string; login: string; email: string; project: string; baseUrl: string }
+export interface GitlabAccount { cli: string; login: string; email: string; project: string; baseUrl: string
+  /** The deployment's own SSH key, when setup has made one; worker git and the `ssh -T` check use it instead of the operator's SSH identity. */
+  sshKey?: string }
 export interface FeishuBot { cli: string; appId: string; brand: 'feishu' | 'lark'; botId: string; name: string }
 /** The GitHub account of a GitHub deployment; callers that act through gh use it. */
 export function githubAccount(deployment: { github?: GithubAccount }): GithubAccount {
@@ -150,12 +152,14 @@ export function executable(name: string, path: string, exclude?: string): string
 
 export type Probe = (argv: string[]) => Promise<string>
 /** Run startup checks through DSH's worker subprocess service with worker shims removed from PATH so a `gh` wrapper script reaches the real binary. */
-export function workerProbe(subprocess: SubprocessRuntime, stateDir: string, cwd: string, signal: AbortSignal): Probe {
+export function workerProbe(subprocess: SubprocessRuntime, stateDir: string, cwd: string, signal: AbortSignal, env: Record<string, string> = {}): Probe {
   const path = withoutDirectory(process.env.PATH ?? '', workerBin(stateDir))
   // On Windows `env` resolves to an MSYS binary that rewrites a leading-slash argument such as an API path into a
-  // Windows path, so pass PATH through the subprocess environment instead of through `env`.
-  if (process.platform === 'win32') return argv => runAsWorker(subprocess, argv, cwd, AbortSignal.any([signal, AbortSignal.timeout(60_000)]), { PATH: path })
-  return argv => runAsWorker(subprocess, ['env', `PATH=${path}`, ...argv], cwd, AbortSignal.any([signal, AbortSignal.timeout(60_000)]))
+  // Windows path, so pass PATH through the subprocess environment instead of through `env`. POSIX passes the extra
+  // assignments through `env` instead, because DSH strips credential-shaped names from a spawned environment.
+  if (process.platform === 'win32') return argv => runAsWorker(subprocess, argv, cwd, AbortSignal.any([signal, AbortSignal.timeout(60_000)]), { PATH: path, ...env })
+  const assignments = Object.entries(env).map(([name, value]) => `${name}=${value}`)
+  return argv => runAsWorker(subprocess, ['env', `PATH=${path}`, ...assignments, ...argv], cwd, AbortSignal.any([signal, AbortSignal.timeout(60_000)]))
 }
 
 const GithubUser = z.object({ login: z.string().regex(/^[A-Za-z0-9-]+$/), id: z.number().int().positive() })
@@ -230,8 +234,11 @@ async function resolveGitlab(machine: Machine, project: GitlabProject, probe: Pr
   // the one thing git cannot find for itself.
   const email = agent.commit_email || agent.email || ''
   if (!email) throw new SetupError('gitlabNoCommitEmail', { account: agent.username })
+  // A pasted project token makes setup create this key; its presence is what makes worker git and the SSH check use it.
+  const sshKey = gitlabSshKey(stateDir)
   return { ...machine, repository: info.path_with_namespace,
-    gitlab: { cli, login: agent.username, email, project: info.path_with_namespace, baseUrl: project.baseUrl.replace(/\/+$/, '') } }
+    gitlab: { cli, login: agent.username, email, project: info.path_with_namespace, baseUrl: project.baseUrl.replace(/\/+$/, ''),
+      ...(existsSync(sshKey) ? { sshKey } : {}) } }
 }
 
 const AuthStatus = z.object({ appId: z.string().regex(/^cli_[A-Za-z0-9]+$/), brand: z.enum(['feishu', 'lark']).default('feishu'), identities: z.object({ bot: z.object({ status: z.string() }) }) })

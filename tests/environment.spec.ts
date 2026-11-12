@@ -5,8 +5,8 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SENSITIVE_ENV_PATTERN, type SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
-import { GIT_LOCATION, agentVariables, credentialHelper, runAsWorker, verifyDirectory, verifyEnvironment, verifyTicketRepository, withoutDirectory, workerBin, workerGitConfig, writeEnvironment }
-  from '../src/infra/environment.ts'
+import { GIT_LOCATION, agentVariables, credentialHelper, ensureSshKey, runAsWorker, verifyDirectory, verifyEnvironment,
+  verifyTicketRepository, withoutDirectory, workerBin, workerGitConfig, writeEnvironment } from '../src/infra/environment.ts'
 import { CliError } from '../src/infra/commands.ts'
 import type { Deployment, GitlabAccount } from '../src/deployment.ts'
 import { testDeployment } from './fixtures/deployment.ts'
@@ -314,4 +314,41 @@ describe('GitLab worker environment', () => {
       .rejects.toMatchObject({ code: 'gitlabUrl', values: { url: 'gitlab.example.com' } })
     expect(calls.some(call => call[0] === 'ssh')).toBe(false)
   })
+  it('pushes with the deployment\'s own key and names the file a pasted token is kept in', async () => {
+    const key = join(dir, 'credentials', 'gitlab_ed25519'), file = join(dir, 'credentials', 'gitlab-token')
+    mkdirSync(join(dir, 'credentials'), { recursive: true })
+    writeFileSync(file, 'glpat-secret', { mode: 0o600 })
+    writeFileSync(key, 'private key', { mode: 0o600 })
+    const cli = program(join(dir, 'gitlab-cli'), 'printf %s "$DSH_SUPERAGENT_GITLAB_TOKEN_FILE"')
+    await writeEnvironment(deployment({ cli, sshKey: key }), [])
+    // Worker git pushes with the deployment's key instead of the operator's SSH identity or the repository's sshCommand.
+    expect(readFileSync(workerGitConfig(dir), 'utf8')).toContain(`sshCommand = "ssh -i ${key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"`)
+    // DSH strips credential-shaped variables from a worker environment, so the shim itself exports the file the CLI reads.
+    expect((await exec(join(workerBin(dir), 'gitlab'), ['api', '/user'], { env: { PATH: '/usr/bin:/bin' } })).stdout).toBe(file)
+  })
+  it('mints a fresh deployment key for the account a pasted token names, then registers it', async () => {
+    const key = join(dir, 'credentials', 'gitlab_ed25519')
+    const calls: string[][] = []
+    // ssh-keygen writes the pair; the CLI registers the public half with the account the token names, because GitLab binds
+    // a key to one user and a project access token names a bot user of its own.
+    const probe = async (argv: string[]): Promise<string> => {
+      calls.push(argv)
+      if (argv[0] === 'ssh-keygen') {
+        writeFileSync(key, 'private key', { mode: 0o600 })
+        writeFileSync(`${key}.pub`, 'ssh-ed25519 AAAA the key\n')
+      }
+      return ''
+    }
+    await ensureSshKey(testDeployment({ stateDir: dir, gitlab: account({ cli: 'gitlab', sshKey: key }) }), probe, signal)
+    expect(calls).toEqual([
+      ['ssh-keygen', '-t', 'ed25519', '-N', '', '-C', 'dsh-superagent deployment key', '-f', key],
+      ['gitlab', 'api', '--method', 'POST', '/user/keys', '--field', 'title=dsh-superagent', '--field', 'key=ssh-ed25519 AAAA the key'],
+    ])
+  })
+})
+
+it('points gh at the configuration directory holding a panel-managed token', () => {
+  // gh reads its login from GH_CONFIG_DIR; the token itself never travels as an environment variable, because DSH strips
+  // credential-shaped names from child environments.
+  expect(agentVariables(dir)).toMatchObject({ GH_CONFIG_DIR: join(dir, 'credentials', 'gh'), GH_TOKEN: undefined })
 })

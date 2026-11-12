@@ -1,9 +1,14 @@
 /** Concurrency, retry, and validation tests for settings saves, pause toggling, and policy synchronization. */
+import { existsSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { join } from 'node:path'
 import { afterEach, expect, it, vi } from 'vitest'
 import { UserError } from '../src/core/index.ts'
+import { Credentials } from '../src/app/credentials.ts'
 import { Commands } from '../src/infra/commands.ts'
 import { Setup } from '../src/app/setup.ts'
 import { SettingsConflict } from '../src/app/settings.ts'
+import type { Deployment } from '../src/deployment.ts'
+import { gitlabKind } from '../src/sources/gitlab.ts'
 import { startRuntime, type Host } from './fixtures/host.ts'
 
 let h: Host | undefined
@@ -29,14 +34,14 @@ it('refuses a save of a block that another save changed during its model or acco
   await expect(slow).rejects.toThrow(SettingsConflict)
   expect(store.settings().executor).toMatchObject({ maxWorkers: 2, model: executor.model })
   // An account check that a save of the same Source outruns is refused the same way.
-  const accounts = deferred<void>()
+  const accounts = deferred<Deployment | undefined>()
   vi.spyOn(Setup.prototype, 'checkAccounts').mockImplementationOnce(() => accounts.promise)
   const github = settings.block('source:github')
   const value = github.value as { enabled: boolean; config: Record<string, unknown> }
   const moved = settings.save('source:github', { ...value, config: { ...value.config, cli: '/opt/bin/gh-other' } }, github.revision,
     'panel')
   await settings.save('source:github', { ...value, config: { ...value.config, pollSeconds: 90 } }, github.revision, 'panel')
-  accounts.resolve()
+  accounts.resolve(undefined)
   await expect(moved).rejects.toThrow(SettingsConflict)
   expect(store.settings().sources.github!.config).toMatchObject({ cli: value.config.cli, pollSeconds: 90 })
 })
@@ -98,4 +103,78 @@ it('records nothing for a pause that changes nothing, refuses a sync while setup
   await expect(settings.sync('feishu')).rejects.toThrow(new UserError('nothingToSync', { source: 'feishu' }))
   vi.mocked(Setup.prototype.configured).mockRestore()
   expect(() => settings.block('source:x')).toThrow(new UserError('unknownBlock', { block: 'source:x' }))
+})
+
+const GITLAB = { project: 'acme/platform/widgets', cli: '/opt/gitlab', baseUrl: 'https://gitlab.example.com' }
+const GITLAB_REF = 'DSH_SUPERAGENT_GITLAB_TOKEN'
+/**
+ * Saves the GitLab Source with a pasted token the way the panel does, with the account check answered by the test: the
+ * fixture serves a GitHub CLI, and only where the credential is kept is under test here.
+ */
+async function saveGitlabToken(h: Host, config: Record<string, unknown>, token: string) {
+  const { settings } = h.runtime
+  h.runtime.sources.register(gitlabKind)
+  vi.spyOn(Setup.prototype, 'checkAccounts').mockResolvedValue(undefined)
+  return settings.save('source:gitlab', { enabled: true, config: { ...config, token } }, settings.block('source:gitlab').revision, 'panel')
+}
+
+it('keeps a Source\'s pasted token out of the settings and saves it in the harness credential store', async () => {
+  h = await startRuntime()
+  const { settings, store } = h.runtime
+  const saved = await saveGitlabToken(h, GITLAB, 'glpat-secret')
+  expect(saved).toMatchObject({ saved: true, restarting: true })
+  // The settings, the block and every saved revision keep the other fields only.
+  expect(settings.block('source:gitlab').value).toEqual({ enabled: true, config: { ...GITLAB, pollSeconds: 60, failuresBeforeError: 3,
+    observeIssues: false, observeMergeRequests: false, observeComments: false, observePipelines: false } })
+  expect(JSON.stringify(store.settings())).not.toContain('glpat-secret')
+  expect(JSON.stringify(settings.view())).not.toContain('glpat-secret')
+  // The value lives in the host's credential store, under this deployment's reference, and not in the database.
+  expect(h.secrets.get(GITLAB_REF)).toBe('glpat-secret')
+  // The CLI reads it from a 0600 file that materialize rebuilds from the store alone, as after a rebuild or a restore.
+  const file = join(h.directory, 'credentials', 'gitlab-token')
+  expect(readFileSync(file, 'utf8')).toBe('glpat-secret')
+  expect(statSync(file).mode & 0o777).toBe(0o600)
+  rmSync(file)
+  await new Credentials({ context: h.ctx, store, machine: { stateDir: h.directory } }).materialize()
+  expect(readFileSync(file, 'utf8')).toBe('glpat-secret')
+})
+
+it('puts the previous credential back when the account check refuses a new one, and keeps it across a blank field', async () => {
+  h = await startRuntime()
+  const { settings } = h.runtime
+  await saveGitlabToken(h, GITLAB, 'glpat-secret')
+  const file = join(h.directory, 'credentials', 'gitlab-token')
+  vi.mocked(Setup.prototype.checkAccounts).mockRejectedValue(new Error('project unreadable'))
+  await expect(settings.save('source:gitlab', { enabled: true, config: { ...GITLAB, project: 'acme/other', token: 'glpat-next' } },
+    settings.block('source:gitlab').revision, 'panel')).rejects.toThrow('project unreadable')
+  // Neither the stored token nor the saved project followed the refused save.
+  expect(h.secrets.get(GITLAB_REF)).toBe('glpat-secret')
+  expect(readFileSync(file, 'utf8')).toBe('glpat-secret')
+  expect((settings.block('source:gitlab').value as { config: Record<string, unknown> }).config.project).toBe(GITLAB.project)
+  // A blank token is not a new credential: the stored one stays, and no restart is due for it.
+  vi.mocked(Setup.prototype.checkAccounts).mockResolvedValue(undefined)
+  const blank = await settings.save('source:gitlab', { enabled: true, config: { ...GITLAB, pollSeconds: 120, token: '' } },
+    settings.block('source:gitlab').revision, 'panel')
+  expect(blank).toMatchObject({ saved: true, restarting: false })
+  expect(h.secrets.get(GITLAB_REF)).toBe('glpat-secret')
+})
+
+it('refuses a token handed over by anything but the management panel, before it reaches the store', async () => {
+  h = await startRuntime()
+  const { settings } = h.runtime
+  await saveGitlabToken(h, GITLAB, 'glpat-secret')
+  await expect(settings.save('source:gitlab', { enabled: true, config: { ...GITLAB, token: 'glpat-next' } },
+    settings.block('source:gitlab').revision, 'tool')).rejects.toThrow(new UserError('panelOnlyAccounts'))
+  expect(h.secrets.get(GITLAB_REF)).toBe('glpat-secret')
+})
+
+it('clears a stored credential on request and stops materializing it', async () => {
+  h = await startRuntime()
+  const { settings } = h.runtime
+  await saveGitlabToken(h, GITLAB, 'glpat-secret')
+  const file = join(h.directory, 'credentials', 'gitlab-token')
+  await expect(settings.clearCredential('source:gitlab', 'tool')).rejects.toThrow(new UserError('panelOnlyAccounts'))
+  expect(await settings.clearCredential('source:gitlab', 'panel')).toEqual({ cleared: true })
+  expect(h.secrets.has(GITLAB_REF)).toBe(false)
+  expect(existsSync(file)).toBe(false)
 })

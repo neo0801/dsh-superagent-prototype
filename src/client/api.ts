@@ -120,7 +120,12 @@ export type StateView = ApiResponse<'GET state'>
 export type SetupView = StateView['setup']
 export type SettingsView = ApiResponse<'GET settings'>
 export type Settings = { [B in keyof SettingsView['blocks']]: SettingsView['blocks'][B]['value'] }
-export type SourceView = SettingsView['sources'][number]
+export type SourceView = SettingsView['sources'][number] & {
+  /** Per password field key: whether a value is stored, where it came from, and writability; values are never included. */
+  credentials: Record<string, SourceCredential>
+}
+/** Whether a password field holds a saved credential, where it came from, and whether this page may clear it. */
+export interface SourceCredential { configured: boolean; source?: string; writable: boolean }
 export type SourceStatusRow = ApiResponse<'GET sources'>[number]
 export type TicketRow = ApiResponse<'GET tickets'>['items'][number]
 export type TicketPageView = ApiResponse<'GET tickets/:id'>

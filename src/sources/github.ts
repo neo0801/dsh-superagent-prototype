@@ -44,6 +44,8 @@ export const githubKind: SourceKind<GithubConfig> = {
   fields: [
     { key: 'repository', type: 'text', pattern: '[A-Za-z0-9_.\\-]+/[A-Za-z0-9_.\\-]+', label: { zh: '监听的仓库', en: 'Repository' },
       hint: { zh: '写作 owner/name。这个来源接收这个仓库的通知和讨论；保存时检查智能体账号能否推送到它，然后重启 dsh-superagent。', en: 'Written owner/name. This Source receives the repository\'s notifications and discussion; saving checks that the agent account can push to it, then restarts dsh-superagent.' } },
+    { key: 'token', type: 'password', label: { zh: '部署凭据', en: 'Agent token' },
+      hint: { zh: '粘贴智能体账号的个人访问令牌，scope 为 repo；策略需要读取组织信息时再加 read:org。保存后存入 DSH 凭据存储，不进入设置快照；留空则沿用已保存的凭据。GitHub 的凭据物化为 GH_CONFIG_DIR 下的 hosts.yml。', en: 'Paste the agent account\'s personal access token with the repo scope, and read:org when the policy reads organization information. Saving stores it in the DSH credential store, never the settings snapshot; leave it blank to keep the saved credential. GitHub materializes it as hosts.yml under GH_CONFIG_DIR.' } },
     { key: 'cli', type: 'text', label: { zh: '智能体的 GitHub CLI', en: 'Agent GitHub CLI' },
       hint: { zh: '命令名或绝对路径，通常是用 GH_CONFIG_DIR 登录智能体账号的 gh 包装脚本。智能体以它登录的账号行事，执行器以 gh 调用它。保存时检查它登录的账号能否推送到仓库，然后重启 dsh-superagent。', en: 'A command name or absolute path, usually a gh wrapper signed in to the agent account through GH_CONFIG_DIR. The agent acts as the account it is signed in to, and the Executor calls it as gh. Saving checks that this account can push to the repository, then restarts dsh-superagent.' } },
     { key: 'pollSeconds', type: 'number', advanced: true, min: 60, max: 3600, label: { zh: '轮询间隔 / 秒', en: 'Polling interval / seconds' }, hint: { zh: 'GitHub 要求更长间隔时以 GitHub 为准。', en: 'A longer interval requested by GitHub wins.' } },
